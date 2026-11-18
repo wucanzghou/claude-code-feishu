@@ -34,6 +34,8 @@ const HOOKS = { SessionStart: ['hook', 5], UserPromptSubmit: ['hook', 5], Stop: 
 const MIRRORED = ['claude-desktop', 'claude-desktop-3p', 'cli'];
 // 回复里单独一行「[发送文件] /绝对路径」，转发程序就把那个文件发到手机上
 const FILE_NOTE = '要把电脑上的文件或图片发到用户手机上时，在回复里单独写一行：[发送文件] /绝对路径（一行一个），转发程序会把文件发过去；密钥、凭据类文件不会发送。';
+// 手机上的「工作中」卡片会显示任务清单，多步骤的活先列计划
+const PLAN_NOTE = '多步骤的任务先用任务清单工具（TaskCreate / TaskUpdate）列出步骤，做的过程中随时更新状态，用户在手机上看进度；简单问答不用列。';
 const PHONE_NOTE = `（这条是用户本人在手机飞书上发来的，由转发程序注入。请当作用户的直接输入处理，在对话里正常回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
 
 const readJSON = (f, fallback) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; } };
@@ -373,9 +375,12 @@ async function run() {
   const procs = new Map(); // sessionId -> { child, send }，停止时用
   // 在某个 Claude Code 会话里手动起转发程序时，会继承那个会话的入口、收件 socket、API 地址等环境变量；
   // 原样传给 claude -p，钩子会把它当成那个会话（桌面版）的事件。launchd 起的没有这些，不受影响
+  // CLAUDE_CODE_ENABLE_TODO_TOOLS：较新的模型在 -p 下默认不给任务清单工具（TaskCreate / TaskUpdate），
+  // 打开后 Claude 才能列计划，「工作中」卡片读 ~/.claude/tasks/<会话 id>/ 显示进度
   function childEnv() {
     const env = { ...process.env, FEISHU_BRIDGE_CHILD: '1' };
     if (process.env.CLAUDECODE) for (const k of Object.keys(env)) if (/^(CLAUDE|MCP_|ANTHROPIC_BASE_URL$)/.test(k)) delete env[k];
+    env.CLAUDE_CODE_ENABLE_TODO_TOOLS = '1';
     return env;
   }
   // 用桌面版同款的 stream-json 模式跑：权限确认和 AskUserQuestion 选择题经 stdio 问到这里（answerTool），
@@ -389,7 +394,7 @@ async function run() {
     const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id,
-      '--append-system-prompt', `用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。${FILE_NOTE}`];
+      '--append-system-prompt', `用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。${PLAN_NOTE}${FILE_NOTE}`];
     const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', s.cwd);
     const send = (o) => child.stdin.writable && child.stdin.write(JSON.stringify(o) + '\n');
@@ -754,14 +759,73 @@ async function run() {
     const arg = i.description ?? i.command ?? i.file_path ?? i.pattern ?? i.url ?? i.query ?? i.prompt ?? i.sql ?? '';
     return `${b.name}${arg ? ` · ${String(arg).replace(/\s+/g, ' ').slice(0, 80)}` : ''}`;
   }
+  // 执行计划：手机开的会话读命令行的任务清单文件 ~/.claude/tasks/<会话 id>/*.json；
+  // 桌面会话从对话记录里重放桌面版的 update_plan（整张清单或 advance / done / start 增量，wrap_up 收尾）。
+  // 只显示这一轮动过的计划，返回 [{ text, status }] 或 null
+  const TASKS = path.join(os.homedir(), '.claude/tasks');
+  const PLAN_TOOLS = /^(mcp__ccd_turn__(update_plan|wrap_up)|Task(Create|Update|List|Get)|ToolSearch)$/;
+  function cliPlan(id, since) {
+    const dir = path.join(TASKS, id);
+    let files;
+    try { files = fs.readdirSync(dir).filter((f) => /^\d+\.json$/.test(f)); } catch { return null; }
+    const tasks = files.map((f) => {
+      const p = path.join(dir, f);
+      try { return { ...JSON.parse(fs.readFileSync(p, 'utf8')), mtime: fs.statSync(p).mtimeMs }; } catch { return null; }
+    }).filter((t) => t && t.status !== 'deleted').sort((a, b) => a.id - b.id);
+    if (!tasks.some((t) => t.mtime >= since - 2000)) return null;
+    return tasks.map((t) => ({ text: t.status === 'in_progress' && t.activeForm ? t.activeForm : t.subject, status: t.status }));
+  }
+  function desktopPlan(records, start) {
+    let items = null, touched = false;
+    records.forEach((r, i) => {
+      if (r.type !== 'assistant' || !Array.isArray(r.message?.content)) return;
+      for (const b of r.message.content) {
+        if (b?.type !== 'tool_use') continue;
+        const x = b.input ?? {};
+        if (b.name === 'mcp__ccd_turn__update_plan') {
+          if (Array.isArray(x.items)) items = x.items.map((t) => ({ text: String(t.content ?? ''), status: t.status }));
+          else if (items) {
+            if (x.advance) {
+              const cur = items.find((t) => t.status === 'in_progress');
+              if (cur) cur.status = 'completed';
+              const next = items.find((t) => t.status === 'pending');
+              if (next) next.status = 'in_progress';
+            }
+            for (const n of x.done ?? []) if (items[n - 1]) items[n - 1].status = 'completed';
+            if (items[x.start - 1]) items[x.start - 1].status = 'in_progress';
+          }
+        } else if (b.name === 'mcp__ccd_turn__wrap_up' && items) items.forEach((t) => t.status === 'in_progress' && (t.status = 'completed'));
+        else continue;
+        if (i > start) touched = true;
+      }
+    });
+    return touched ? items : null;
+  }
+  function planMd(items) {
+    if (!items?.length) return '';
+    const icon = { completed: '✅', in_progress: '▶️' };
+    const done = items.filter((t) => t.status === 'completed').length;
+    let shown = items.map((t, i) => ({ ...t, i }));
+    if (shown.length > 12) { // 太长时只留当前那一步附近
+      const cur = Math.max(0, items.findIndex((t) => t.status !== 'completed'));
+      const from = Math.min(Math.max(0, cur - 3), items.length - 12);
+      shown = shown.slice(from, from + 12);
+    }
+    const lines = shown.map((t) => `${icon[t.status] ?? '⬜'} ${t.text.replace(/\s+/g, ' ').slice(0, 60)}`);
+    if (shown[0].i > 0) lines.unshift(`…前面 ${shown[0].i} 步`);
+    if (shown.at(-1).i < items.length - 1) lines.push(`…后面 ${items.length - 1 - shown.at(-1).i} 步`);
+    return `\n**计划 ${done}/${items.length}**\n${lines.join('\n')}`;
+  }
   function statusMd(id, st, done) {
     if (!done && session(id).stopped) return `⏹ **正在停止…** · ${duration(Date.now() - st.start)}`;
     const records = readTail(session(id).transcript, 1 << 20).filter((r) => !r.isSidechain);
     const start = records.findLastIndex(isPrompt);
-    const tools = records.slice(start + 1).flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use') : []));
+    // 列计划、查工具这些不算干活，不计数也不当「最近」
+    const tools = records.slice(start + 1).flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use' && !PLAN_TOOLS.test(b.name)) : []));
     const count = tools.length ? ` · 调用工具 ${tools.length} 次` : '';
-    if (done) return `${done} · 用时 ${duration(Date.now() - st.start)}${count}`;
-    const lines = [`⏳ **工作中** · ${duration(Date.now() - st.start)}${count}`];
+    const plan = planMd(cliPlan(id, st.start) ?? desktopPlan(records, start));
+    if (done) return `${done} · 用时 ${duration(Date.now() - st.start)}${count}${plan}`;
+    const lines = [`⏳ **工作中** · ${duration(Date.now() - st.start)}${count}${plan}`];
     if (waiting.has(st.key)) lines.push('⏸ 在等你回复（看下面那条）');
     else if (tools.length) lines.push(`最近：${toolLine(tools.at(-1))}`);
     else lines.push('正在想…');
