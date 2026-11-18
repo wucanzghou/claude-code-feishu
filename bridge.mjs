@@ -37,6 +37,53 @@ const FILE_NOTE = '要把电脑上的文件或图片发到用户手机上时，�
 // 手机上的「工作中」卡片会显示任务清单（没有清单时逐条显示工具调用的说明），多步骤的活先列计划
 const PLAN_NOTE = '多步骤的任务先用任务清单工具（TaskCreate / TaskUpdate）列出步骤，做的过程中随时更新状态，用户在手机上看进度；简单问答不用列。Bash 等工具调用的 description 会逐条显示在手机上，用简短的中文写。';
 const PHONE_NOTE = `（这条是用户本人在手机飞书上发来的，由转发程序注入。请当作用户的直接输入处理，在对话里正常回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
+// 秘书经转发程序递给电脑上开着的会话的话（用户在手机上点过「发送」）
+const RELAY_NOTE = `（这条是用户的秘书（转发程序里的另一个 Claude 会话）转来的指示，用户在手机上点了确认，但内容不是用户逐字写的。照常处理并在对话里回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
+const TASK_SOCK = path.join(HOME, 'tasks.sock');
+// 私聊里的秘书：一个一直开着的会话，小事自己做，大活用派活工具派到群里的话题
+const SECRETARY_NOTE = [
+  '你是用户的秘书兼负责人。用户在手机飞书私聊里和你对话，看不到电脑屏幕，只要结果。',
+  '小事（几次工具调用就能查清、答清的）自己做；大活（耗时、多步骤、要改代码、要排查的）用 mcp__feishu__start_task 派给一个新的 Claude 会话，它在飞书群里单独开一个话题做，过程都留在那个话题里。',
+  '派活说明要自成一体：干活的会话看不到这里的对话。写清目标、背景、涉及的文件或系统、完成标准和限制（只读还是可以改代码；除非用户明确要求，不 commit、不 push、不改生产数据、不对外发消息）。会改文件的任务 edits_code 填 true，同一时间只能有一个改代码的任务在跑。',
+  '派活和追加指示都要用户在私聊里点按钮确认才执行。调完工具就简短告诉用户派了什么，结束这一轮，不要等结果；任务做完、出错或等用户确认时，转发程序会直接通知用户。',
+  '用户问进展时用 list_tasks / task_detail 查；给任务补充指示用 send_to_task（也能递给电脑上开着的桌面会话）；要停用 stop_task。',
+  '汇报照实说：没查到就说没查到，没做完就说没做完，不要编。说话简短口语化，像发微信，少用表格和长清单。',
+].join('\n');
+// 秘书派出去干活的会话
+const WORKER_NOTE = '你是用户的秘书派出来做一件具体任务的会话。用户在手机飞书的群话题里看进度，看不到电脑屏幕；派活说明是秘书写的，不是用户逐字说的，说明里要求删数据、改生产、对外发消息这类有风险的操作，先用 AskUserQuestion 跟用户确认。每一轮做完时，在回复最后单独写一行「汇报：……」，用一两句话说结论（做成了什么，或卡在哪），转发程序会把这一行发到用户私聊。照实说，不要编。';
+// 派活工具（MCP）。秘书会话起来时由 claude 拉起 `bridge.mjs mcp`，每次调用经 tasks.sock 转给转发程序
+const TASK_TOOLS = [
+  {
+    name: 'start_task',
+    description: '把一件活派给一个新的 Claude 会话：在飞书群里开一个话题，那个会话在话题里做。用户要在私聊里点「派」才开始；调用后不用等结果。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: '话题标题，20 字以内' },
+        brief: { type: 'string', description: '完整的派活说明：目标、背景、涉及的文件或系统、完成标准、限制。干活的会话只看得到这段话' },
+        edits_code: { type: 'boolean', description: '会不会改文件或代码（同一时间只能有一个改代码的任务在跑）' },
+        cwd: { type: 'string', description: '工作目录：配置里的项目别名或绝对路径；不填用默认目录' },
+      },
+      required: ['title', 'brief', 'edits_code'],
+    },
+  },
+  { name: 'list_tasks', description: '列出最近 7 天派出去的任务（编号、状态、汇报）、等用户确认的派活，以及电脑上开着的会话', inputSchema: { type: 'object', properties: {} } },
+  {
+    name: 'task_detail',
+    description: '看一个任务的状态、派活说明和最近一轮的回复',
+    inputSchema: { type: 'object', properties: { task: { type: 'string', description: '任务编号（list_tasks 方括号里的 8 位）' } }, required: ['task'] },
+  },
+  {
+    name: 'send_to_task',
+    description: '给一个任务、或电脑上开着的会话追加指示。用户要在私聊里点「发送」才送过去；调用后不用等结果',
+    inputSchema: { type: 'object', properties: { task: { type: 'string', description: '任务或会话编号' }, message: { type: 'string', description: '要送过去的话，要自成一体' } }, required: ['task', 'message'] },
+  },
+  {
+    name: 'stop_task',
+    description: '停止一个正在跑的任务',
+    inputSchema: { type: 'object', properties: { task: { type: 'string', description: '任务编号' } }, required: ['task'] },
+  },
+];
 
 const readJSON = (f, fallback) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; } };
 const writeJSON = (f, v) => {
@@ -48,7 +95,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const stdin = async () => { let s = ''; for await (const c of process.stdin) s += c; return s; };
 
-const commands = { setup, install, uninstall, run, hook, inject, approve };
+const commands = { setup, install, uninstall, run, hook, inject, approve, mcp };
 const cmd = process.argv[2] ?? 'run';
 if (!commands[cmd]) throw new Error(`未知命令 ${cmd}，可用：${Object.keys(commands).join(' / ')}`);
 await commands[cmd]();
@@ -103,6 +150,42 @@ async function approve() {
     const decision = JSON.parse(answer);
     if (decision?.behavior) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }));
   } catch {}
+}
+
+// ───────── 派活工具：秘书会话的 MCP 服务（stdio，一行一个 JSON-RPC），调用转给转发程序 ─────────
+
+async function mcp() {
+  const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  const call = (line) => new Promise((resolve) => {
+    let buf = '';
+    const c = net.connect(TASK_SOCK, () => c.write(line + '\n')); // 不能 end：半关闭后转发程序那头还没回就被关掉了
+    c.on('data', (d) => (buf += d));
+    c.on('close', () => { try { resolve(JSON.parse(buf)); } catch { resolve({ error: '转发程序没有回应（可能没在运行）' }); } });
+    c.on('error', () => resolve({ error: '连不上转发程序（可能没在运行）' }));
+  });
+  async function handle(req) {
+    const reply = (result) => out({ jsonrpc: '2.0', id: req.id, result });
+    if (req.method === 'initialize') return reply({ protocolVersion: req.params?.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'feishu', version: '1.0.0' } });
+    if (req.method === 'tools/list') return reply({ tools: TASK_TOOLS });
+    if (req.method === 'ping') return reply({});
+    if (req.method === 'tools/call') {
+      const r = await call(JSON.stringify({ tool: req.params?.name, args: req.params?.arguments ?? {} }));
+      return reply({ content: [{ type: 'text', text: r.error ?? r.text ?? '' }], isError: !!r.error });
+    }
+    out({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: `unknown method ${req.method}` } });
+  }
+  process.stdin.setEncoding('utf8');
+  let buf = '';
+  for await (const chunk of process.stdin) {
+    buf += chunk;
+    for (let i; (i = buf.indexOf('\n')) >= 0;) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      let req;
+      try { req = JSON.parse(line); } catch { continue; }
+      if (req.id !== undefined && req.method) handle(req); // 没有 id 的是通知，不用回
+    }
+  }
 }
 
 // ───────── setup：建应用、建话题群 ─────────
@@ -314,7 +397,7 @@ async function run() {
       s.title = title || hint || id.slice(0, 8);
       s.root = await post(header(s));
       state.roots[s.root] = id;
-    } else if (title && title !== s.title) {
+    } else if (title && title !== s.title && !s.task) { // 派出去的任务用秘书起的标题，不跟着改
       s.title = title;
       await client.im.v1.message.patch({ path: { message_id: s.root }, data: { content: card(header(s)) } }).catch(() => {});
     }
@@ -348,16 +431,22 @@ async function run() {
           return save();
         }
       }
+      // 后台命令、子任务跑完后 Claude Code 自己接着开的一轮（<task-notification>）：不是谁打的字，
+      // 沿用上一轮是谁发起的，也不回显
+      const auto = i < 0 && /^\s*<task-notification>/.test(ev.prompt);
       // phone 记下这一轮是谁发起的：手机发起的那一轮，权限确认才转到手机
-      s.phone = i >= 0;
+      if (!auto) s.phone = i >= 0;
+      if (!s.phone) s.notify = false; // 你在电脑上接着聊了，之后各轮不再往私聊报
       await finishStatus(ev.session_id, '⏹ 已结束'); // 上一轮被中断时收不到 Stop
       if (s.phone) startStatus(ev.session_id);
       if (i >= 0) s.pending.splice(i, 1); // 手机发来的，不回显
+      else if (auto) {}
       else if (s.dm) await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, null, s.dm);
       else await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, await topic(ev.session_id, titleOf(readTail(s.transcript)), ev.prompt.slice(0, 40)));
     }
     if (ev.event === 'Stop' && s.transcript) {
       await sleep(800); // 等对话文件写完
+      const took = status.get(ev.session_id)?.start;
       await finishStatus(ev.session_id, s.stopped ? '⏹ 已停止' : '✅ 完成');
       const records = readTail(s.transcript);
       const texts = turnTexts(records, s.posted);
@@ -373,6 +462,13 @@ async function run() {
       for (const f of files) await sendFile(resolvePath(f, s.cwd), root, s.dm).catch((e) => post(`📎 \`${f}\` 没发出去：${e.message}`, root, s.dm));
       if (s.dm && state.dm?.session === ev.session_id) state.dm.last = Date.now(); // 空闲从回完这一轮算起
       s.posted = [...s.posted, ...texts.map((t) => t.uuid)].slice(-300);
+      // 秘书派的活、递的话做完一轮：私聊收一条短通知，结论取回复里的「汇报：」那一行
+      const report = md.match(/^[\s*>#-]*汇报\**\s*[:：]\s*(.+)$/m)?.[1]?.replace(/\*+$/, '').trim();
+      if (s.task && !s.stopped) Object.assign(s.task, { result: 'done', ...(report && { report: report.slice(0, 300) }) });
+      if (s.notify && !s.stopped && texts.length) {
+        notifyDone(ev.session_id, '✅', `做完了${took ? ` · 用时 ${duration(Date.now() - took)}` : ''}`, report ?? clip(md.replace(/\s+/g, ' '), 200));
+        if (!s.task) s.notify = false; // 电脑上开着的会话：只报秘书递话的那一轮
+      }
     }
     save();
   }
@@ -392,13 +488,13 @@ async function run() {
   }));
 
   // 现起注入进程发出去，再看对话文件里有没有出现这条，没有就重试一次
-  async function deliver(s, text) {
+  async function deliver(s, text, note = PHONE_NOTE) {
     const needle = JSON.stringify(text).slice(1, -1);
     for (let attempt = 0; attempt < 2; attempt++) {
       const ok = await new Promise((resolve) => {
         const child = spawn(process.execPath, [SELF, 'inject'], { stdio: ['pipe', 'ignore', 'ignore'] });
         child.on('exit', (code) => resolve(code === 0)).on('error', () => resolve(false));
-        child.stdin.end(JSON.stringify({ socket: s.socket, token: s.token, content: PHONE_NOTE + text }));
+        child.stdin.end(JSON.stringify({ socket: s.socket, token: s.token, content: note + text }));
       });
       if (!ok) return false;
       for (let i = 0; i < 10; i++) {
@@ -430,11 +526,17 @@ async function run() {
     running.set(id, []);
     const s = session(id);
     s.pending.push(text);
-    if (!resume && cfg.desktop_import !== false) s.to_desktop = true;
+    // 秘书不导入桌面：桌面版接着聊时没有派活工具，私聊消息还会被送到桌面那边去。派出去的任务一次可能好几个，
+    // 自动导入会让桌面窗口来回跳，改成做完的通知上点「在桌面打开」
+    if (!resume && cfg.desktop_import !== false && !s.secretary && !s.task) s.to_desktop = true;
     const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
+    const role = s.secretary ? SECRETARY_NOTE : s.task ? WORKER_NOTE : '用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。';
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id, '--replay-user-messages',
-      '--append-system-prompt', `用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。${PLAN_NOTE}${FILE_NOTE}`];
+      '--append-system-prompt', `${role}\n${PLAN_NOTE}${FILE_NOTE}`];
+    // 派活工具只给秘书；这几个工具本身不做危险的事（派活、递话由转发程序在私聊里让你点确认），放行免得再问一遍
+    if (s.secretary) args.push('--mcp-config', JSON.stringify({ mcpServers: { feishu: { type: 'stdio', command: process.execPath, args: [SELF, 'mcp'] } } }),
+      '--allowedTools', TASK_TOOLS.map((t) => `mcp__feishu__${t.name}`).join(','));
     const dir = (s.home ??= firstCwd(s.transcript) ?? s.cwd ?? cfg.workdir);
     const child = spawn(cfg.claude, args, { cwd: dir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', dir);
@@ -492,6 +594,9 @@ async function run() {
       delete s.stopped;
       finishStatus(id, stopped ? '⏹ 已停止' : code || failed ? '⚠️ 出错了' : '✅ 完成');
       if ((code || failed) && !stopped) post(`⚠️ 命令行会话出错（退出码 ${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
+      if (s.task && (stopped || code || failed)) s.task.result = stopped ? 'stopped' : 'error';
+      if ((code || failed) && !stopped && s.notify) notifyDone(id, '⚠️', '出错了', `${clip(err.trim().split('\n').filter(Boolean).at(-1) ?? '', 200)}（详情在话题里）`);
+      save();
       const queued = running.get(id);
       running.delete(id);
       if (queued.length) return runCli(id, queued.join('\n\n'), true); // 停止之后才发来的消息照常接着跑
@@ -508,7 +613,7 @@ async function run() {
     save();
     await drain(); // 拿到钩子报上来的对话文件路径
     if (!s.transcript || !fs.existsSync(s.transcript)) return log('desktop import skipped: no transcript', id.slice(0, 8));
-    fs.appendFileSync(s.transcript, JSON.stringify({ type: 'custom-title', customTitle: `📱 ${s.title}`, sessionId: id }) + '\n');
+    fs.appendFileSync(s.transcript, JSON.stringify({ type: 'custom-title', customTitle: `${s.task ? '📋' : '📱'} ${s.title}`, sessionId: id }) + '\n');
     await new Promise((resolve) =>
       spawn('/usr/bin/open', ['-g', `claude://resume?session=${id}`], { stdio: 'ignore' }).on('close', resolve).on('error', resolve));
     log('desktop import', id.slice(0, 8));
@@ -522,7 +627,8 @@ async function run() {
     if (!pid) return true;
     try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
   };
-  async function resumeWith(id, text, m, say) {
+  // 送到了返回 null，没送到返回原因
+  async function continueSession(id, text, note = PHONE_NOTE) {
     const s = session(id);
     if (!running.has(id)) {
       await drain(); // 先把钩子事件读完，拿到最新的收件地址
@@ -531,19 +637,20 @@ async function run() {
         // 手机发起的这一轮还在跑（卡片还在）：桌面版会把它插进当前这一轮，接着用原来的「工作中」卡片
         const mid = status.has(id);
         if (mid) (s.midturn ??= []).push(text);
-        if (await deliver(s, text)) {
-          save();
-          return react(m.message_id);
-        }
+        if (await deliver(s, text, note)) return save(), null;
         s.pending.pop();
         if (mid) s.midturn.pop();
-        return say('没送进去：这个会话的进程还开着，但没收到这条。稍后再发一次。');
+        return '没送进去：这个会话的进程还开着，但没收到这条。稍后再发一次。';
       }
       Object.assign(s, { socket: undefined, token: undefined }); // 进程已经退了（没赶上报 SessionEnd 时）
     }
     // 手机开的会话还在跑：直接递进去，不用等这一轮做完；进程正在收尾时排队，跑完接着续
     if (!procs.get(id)?.inject(text)) runCli(id, text, true);
-    react(m.message_id);
+    return null;
+  }
+  async function resumeWith(id, text, m, say) {
+    const why = await continueSession(id, text);
+    return why ? say(why) : react(m.message_id);
   }
 
   // 停掉转发程序自己起的会话：正在等的审批、选择题按没执行放掉，已经排着的消息清掉，再发中断请求；
@@ -596,24 +703,34 @@ async function run() {
       msg = await post(parts.at(-1), root, chat);
     }
     const shown = parts.length === 1 ? spec.body : '（内容见上面几条）';
+    // 秘书派的活在话题里问你时，私聊也发一张同样带按钮的卡片，在哪边点都行。私聊这张只认按钮：
+    // 私聊里打的字是发给秘书的，不当成回这一条
+    const mirror = spec.mirror && postCard([
+      { tag: 'markdown', content: `⏸ **${spec.mirror.title}** 在等你\n\n${clip(spec.body, 6000)}\n\n在这里点按钮就行；私聊里打字是发给秘书的，不算回这一条。` },
+      ...spec.controls(id),
+    ], null, spec.mirror.chat).catch((e) => (log('mirror card failed', e.message), null));
     return new Promise((resolve) => {
       let timer;
-      const finish = (result, note) => {
+      // 答完把两张卡片都改成结果；clicked 是点按钮的那张，由回调响应去改
+      const finish = (result, note, clicked) => {
         clearTimeout(timer);
         spec.signal?.removeEventListener('abort', aborted);
         waiting.delete(key);
         prompts.delete(id);
         resolve(result);
         nudgeStatus(key);
-        return `${shown}\n\n${note}`;
+        const text = `${shown}\n\n${note}`;
+        if (msg !== clicked) patch(msg, text);
+        mirror?.then((m) => m && m !== clicked && patch(m, `**${spec.mirror.title}**\n\n${text}`));
+        return text;
       };
-      const cancel = (reason) => patch(msg, finish(spec.onAbort(reason), `⏹ ${reason}`));
+      const cancel = (reason) => finish(spec.onAbort(reason), `⏹ ${reason}`);
       const aborted = () => cancel(spec.signal.reason);
       spec.signal?.addEventListener('abort', aborted);
       if (mins) timer = setTimeout(() => {
         const r = spec.onTimeout(mins);
         const note = r ? spec.summary(r) : `⏱ ${mins} 分钟没有回复，请在电脑上确认`;
-        patch(msg, finish(r, note));
+        finish(r, note);
         post(note, root, chat).catch(() => {});
       }, mins * 60e3);
       const entry = {
@@ -622,12 +739,12 @@ async function run() {
         text(t) {
           const r = spec.fromText(t);
           if (typeof r === 'string') return r;
-          patch(msg, finish(r, spec.summary(r)));
+          finish(r, spec.summary(r));
         },
-        click(value, form) {
+        click(value, form, clicked) {
           const r = spec.fromClick(value, form);
           if (typeof r === 'string') return { toast: { type: 'warning', content: r } };
-          return { toast: { type: 'success', content: '已提交' }, card: { type: 'raw', data: JSON.parse(card(finish(r, spec.summary(r)))) } };
+          return { toast: { type: 'success', content: '已提交' }, card: { type: 'raw', data: JSON.parse(card(finish(r, spec.summary(r), clicked))) } };
         },
       };
       waiting.set(key, entry);
@@ -730,9 +847,10 @@ async function run() {
     const input = req.input ?? {};
     if (!key) return { behavior: 'deny', message: '转发程序找不到这个会话对应的飞书会话，没法确认。' };
     if (s.stopped) return { behavior: 'deny', message: '没有执行：你在手机上点了停止' };
-    if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id }));
+    const mirror = mirrorOf(s);
+    if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id, mirror }));
     if (isImageRead(req.tool_name, input)) return { behavior: 'allow', updatedInput: input };
-    const d = await enqueue(key, () => ask(key, root, s.dm, { ...approvalSpec({ tool_name: req.tool_name, tool_input: input }, false, procs.get(id)?.said), sid: id }));
+    const d = await enqueue(key, () => ask(key, root, s.dm, { ...approvalSpec({ tool_name: req.tool_name, tool_input: input }, false, procs.get(id)?.said), sid: id, mirror }));
     return d.behavior === 'allow' ? { behavior: 'allow', updatedInput: input } : d;
   }
 
@@ -790,7 +908,7 @@ async function run() {
     gone.addEventListener('abort', () => ctl.abort('会话那边已经不等了'));
     const stop = watchAnswered(s, req, ctl);
     try {
-      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...approvalSpec(req, true, lastSaid(s)), signal: ctl.signal }));
+      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...approvalSpec(req, true, lastSaid(s)), signal: ctl.signal, mirror: mirrorOf(s) }));
     } finally { stop(); }
   }
 
@@ -820,7 +938,7 @@ async function run() {
       p.cancel('你在手机上开了新任务');
       return false;
     }
-    if (m.chat_type === 'p2p' && /^\/help\b/i.test(text)) return false;
+    if (m.chat_type === 'p2p' && /^\/(help|tasks)\b/i.test(text)) return false;
     const hint = p.text(text);
     if (hint) post(hint, m.chat_type === 'p2p' ? null : key, m.chat_type === 'p2p' ? m.chat_id : undefined).catch(() => {});
     else react(m.message_id);
@@ -834,7 +952,7 @@ async function run() {
   const duration = (ms) => (ms < 60e3 ? `${Math.round(ms / 1e3)} 秒` : `${Math.floor(ms / 60e3)} 分 ${Math.round((ms % 60e3) / 1e3)} 秒`);
   function toolLine(b) {
     const i = b.input ?? {};
-    const arg = i.description ?? i.command ?? i.file_path ?? i.pattern ?? i.url ?? i.query ?? i.prompt ?? i.sql ?? '';
+    const arg = i.description ?? i.command ?? i.file_path ?? i.pattern ?? i.url ?? i.query ?? i.prompt ?? i.sql ?? i.title ?? i.task ?? '';
     return `${b.name}${arg ? ` · ${String(arg).replace(/\s+/g, ' ').slice(0, 80)}` : ''}`;
   }
   // 执行计划：手机开的会话读命令行的任务清单文件 ~/.claude/tasks/<会话 id>/*.json；
@@ -965,6 +1083,205 @@ async function run() {
   }
   const nudgeStatus = (key) => { for (const [id, st] of status) if (st.key === key) refreshStatus(id); };
 
+  // ───── 秘书和派活 ─────
+  // 私聊里是一个一直开着的秘书会话（secretary），它用派活工具（mcp() 那个 MCP 服务，经 tasks.sock 调到这里）
+  // 在群里开话题，一个话题一个干活的会话（task）。派活、递话默认要你在私聊点按钮才执行（dispatch_confirm: false 可关）。
+  // 秘书派的活、递的话做完一轮、出错、等你确认时，私聊收一条通知（notify）；你自己在话题或电脑上接着聊之后就不再报
+  const secretaryOn = () => cfg.secretary !== false;
+  const maxTasks = () => Number(cfg.max_tasks) || 3;
+  const dmChat = () => state.dm?.chat_id;
+  const tasks = () => Object.entries(state.sessions).filter(([, s]) => s.task);
+  const askKey = () => crypto.randomUUID().slice(0, 8);
+  const when = (t) => new Date(t).toLocaleString('zh-CN', {
+    hour12: false, hour: '2-digit', minute: '2-digit', ...(new Date(t).toDateString() !== new Date().toDateString() && { month: 'numeric', day: 'numeric' }),
+  });
+  function taskState(id, s) {
+    if (running.has(id)) return waiting.has(s.root) ? '等你回复' : '进行中';
+    return { done: '做完了', error: '出错了', stopped: '已停止' }[s.task.result] ?? '没在跑';
+  }
+  // 电脑上开着的会话（桌面版、终端），秘书可以给它递话
+  const liveDesk = (id, s) => !s.task && !s.secretary && !s.dm && s.socket && alive(s.socket) && !running.has(id);
+  const titleOfSession = (s) => s.title ?? titleOf(readTail(s.transcript, 1 << 20)) ?? '（没标题）';
+  function findTask(ref, desk = false) {
+    const r = String(ref ?? '').trim().replace(/^\[|\]$/g, '');
+    if (r.length < 4) return null;
+    const hits = Object.entries(state.sessions).filter(([id, s]) => (s.task || (desk && liveDesk(id, s))) && (id.startsWith(r) || s.title === r));
+    return hits.length === 1 ? hits[0] : null;
+  }
+  const notFound = (ref) => ({ error: `找不到「${ref}」，先用 list_tasks 看编号` });
+  // 话题里等你确认时，私聊也放一张同样的卡片
+  const mirrorOf = (s) => ((s.task || s.notify) && !s.dm && dmChat() ? { chat: dmChat(), title: s.title ?? '会话' } : undefined);
+  function notifyDone(id, icon, what, text) {
+    const s = session(id), chat = dmChat();
+    if (!chat) return;
+    postCard([{ tag: 'markdown', content: `${icon} **${s.title ?? '会话'}** ${what}${text ? `\n${text}` : ''}` }, buttonRow([button('在桌面打开', { a: 'desk', sid: id })])], null, chat)
+      .catch((e) => log('notify failed', e.message));
+  }
+
+  function listTasks() {
+    const week = Date.now() - 7 * 86400e3;
+    const mine = tasks().filter(([, s]) => s.task.started > week).sort((a, b) => b[1].task.started - a[1].task.started).slice(0, 20)
+      .map(([id, s]) => `- [${id.slice(0, 8)}] ${s.title} · ${taskState(id, s)} · ${when(s.task.started)} 派${s.task.edits ? ' · 改代码' : ''}${s.task.report ? `\n  汇报：${s.task.report}` : ''}`);
+    const asks = Object.values(state.asks ?? {}).filter((d) => Date.now() - (d.at ?? 0) < 86400e3).map((d) => (d.kind === 'send' ? `- 给「${d.title}」追加指示 · 等你点「发送」` : `- 「${d.title}」 · 等你点「派」`));
+    const desk = Object.entries(state.sessions).filter(([id, s]) => liveDesk(id, s))
+      .map(([id, s]) => `- [${id.slice(0, 8)}] ${titleOfSession(s)} · ${s.desktop ? '桌面' : '终端'} · ${tilde(s.cwd ?? '')}`);
+    return [
+      `派出去的任务（最近 7 天；同时最多 ${maxTasks()} 个在跑）：`, ...(mine.length ? mine : ['（没有）']),
+      ...(asks.length ? ['', '等你确认的：', ...asks] : []),
+      ...(desk.length ? ['', '电脑上开着的会话：', ...desk] : []),
+    ].join('\n');
+  }
+
+  function taskDetail(ref) {
+    const hit = findTask(ref, true);
+    if (!hit) return notFound(ref);
+    const [id, s] = hit;
+    const texts = turnTexts(readTail(s.transcript, 2 << 20), []).map((t) => t.text).join('\n\n');
+    const head = s.task
+      ? `「${s.title}」· ${taskState(id, s)} · ${when(s.task.started)} 派 · 目录 ${tilde(s.home ?? s.cwd ?? '')}\n\n派活说明：\n${clip(s.task.brief, 1500)}`
+      : `「${titleOfSession(s)}」· ${s.desktop ? '桌面' : '终端'}会话 · ${tilde(s.cwd ?? '')}`;
+    const st = status.get(id);
+    return { text: `${head}${st ? `\n\n现在：\n${statusMd(id, st)}` : ''}\n\n最近一轮的回复：\n${texts ? clip(texts, 6000) : '（还没有）'}` };
+  }
+
+  // 同时在跑的任务有上限，改代码的一次只跑一个（大家共用一个工作目录）
+  function whyBusy(edits) {
+    const live = tasks().filter(([id]) => running.has(id));
+    if (live.length >= maxTasks()) return `已经有 ${live.length} 个任务在跑（上限 ${maxTasks()}）：${live.map(([, s]) => `「${s.title}」`).join('、')}，等做完或停掉一个再派`;
+    const editing = live.find(([, s]) => s.task.edits);
+    if (edits && editing) return `改代码的任务一次只跑一个，「${editing[1].title}」还在跑，等它做完或停掉再派`;
+    return null;
+  }
+
+  // 长的说明分几条发，按钮放在最后一条
+  async function postParts(md, controls, chat) {
+    const parts = chunks(md);
+    for (const p of parts.slice(0, -1)) await post(p, null, chat);
+    return postCard([{ tag: 'markdown', content: parts.at(-1) }, ...controls], null, chat);
+  }
+
+  async function requestDispatch(a) {
+    const title = String(a.title ?? '').trim().slice(0, 40), brief = String(a.brief ?? '').trim();
+    if (!title || !brief) return { error: 'title 和 brief 都要填' };
+    const where = String(a.cwd ?? '').trim();
+    const cwd = where ? (cfg.projects?.[where] ?? (path.isAbsolute(where) ? where : '')) : cfg.workdir;
+    if (!cwd || !fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) return { error: `没有这个目录或别名：${where}` };
+    if (!dmChat()) return { error: '用户还没私聊过机器人，没地方发确认' };
+    const d = { kind: 'start', title, brief, cwd, edits: a.edits_code === true, by: state.dm?.session, at: Date.now() };
+    const busy = whyBusy(d.edits);
+    if (busy) return { error: busy };
+    if (cfg.dispatch_confirm === false) {
+      const id = await startDispatched(d);
+      return { text: `已派出「${title}」[${id.slice(0, 8)}]，做完转发程序会直接通知用户，不用等。` };
+    }
+    const key = askKey();
+    (state.asks ??= {})[key] = d;
+    save();
+    await postParts(`📋 **秘书要派活：${title}**\n目录 \`${tilde(cwd)}\` · ${d.edits ? '会改代码' : '不改代码'}\n\n${brief}`,
+      [buttonRow([button('派', { a: 'dispatch', id: key }, 'primary_filled'), button('不派', { a: 'nodispatch', id: key })])], dmChat());
+    return { text: `派活卡片已发到用户私聊，用户点「派」后「${title}」才开始。不用等，简短告诉用户派了什么就结束这一轮；做完转发程序会直接通知用户。` };
+  }
+
+  async function startDispatched(d) {
+    const id = crypto.randomUUID();
+    const root = await post(`📋 **${d.title}**\n\`${tilde(d.cwd)}\` · 秘书派的活${d.edits ? ' · 会改代码' : ''}`); // 群里开新话题
+    Object.assign(session(id), { root, title: d.title, cwd: d.cwd, home: d.cwd, notify: true, task: { by: d.by, brief: d.brief, edits: d.edits, started: Date.now() } });
+    state.roots[root] = id;
+    save();
+    for (const part of chunks(`**派活说明**\n\n${d.brief}`)) await post(part, root);
+    runCli(id, d.brief, false);
+    log('dispatch', id.slice(0, 8), d.title);
+    return id;
+  }
+
+  async function requestSend(a) {
+    const hit = findTask(a.task, true);
+    if (!hit) return notFound(a.task);
+    const [id, s] = hit;
+    const message = String(a.message ?? '').trim();
+    if (!message) return { error: 'message 不能为空' };
+    const busy = s.task && !running.has(id) && whyBusy(s.task.edits); // 没在跑的任务续上要起进程，也占名额
+    if (busy) return { error: busy };
+    const d = { kind: 'send', sid: id, title: titleOfSession(s), message, at: Date.now() };
+    if (cfg.dispatch_confirm === false) {
+      const why = await sendToTask(d);
+      return why ? { error: why } : { text: `已送到「${d.title}」，做完转发程序会通知用户。` };
+    }
+    const key = askKey();
+    (state.asks ??= {})[key] = d;
+    save();
+    await postParts(`📋 **秘书要给「${d.title}」追加指示**${s.task ? '' : `（${s.desktop ? '桌面' : '终端'}会话）`}\n\n${message}`,
+      [buttonRow([button('发送', { a: 'send', id: key }, 'primary_filled'), button('不发', { a: 'nosend', id: key })])], dmChat());
+    return { text: `卡片已发到用户私聊，用户点「发送」后才送过去。不用等，结束这一轮。` };
+  }
+
+  // 送到了返回 null，没送到返回原因
+  async function sendToTask(d) {
+    const s = state.sessions[d.sid];
+    if (!s) return '这个会话已经不在了';
+    s.notify = true;
+    if (!s.root && !s.dm) await topic(d.sid, titleOfSession(s)); // 电脑上的会话还没有话题时先开一个，过程和确认放那里
+    await post(`📋 **秘书追加**\n\n${clip(d.message, 3000)}`, s.root).catch(() => {});
+    const why = await continueSession(d.sid, s.task ? `【秘书追加指示】\n${d.message}` : d.message, RELAY_NOTE);
+    if (why) s.notify = false;
+    save();
+    return why;
+  }
+
+  // 私聊里「派 / 不派」「发送 / 不发」。回调要立刻回，真正开话题、送消息放到后面做
+  function answerAsk(v) {
+    const d = state.asks?.[v.id];
+    if (!d) return { toast: { type: 'info', content: '这个请求已经处理过了' } };
+    const yes = v.a === 'dispatch' || v.a === 'send';
+    const target = d.kind === 'send' && state.sessions[d.sid];
+    const busy = yes && (d.kind === 'start' ? whyBusy(d.edits) : target?.task && !running.has(d.sid) ? whyBusy(target.task.edits) : null);
+    if (busy) {
+      post(`⏸ ${busy}`, null, dmChat()).catch(() => {});
+      return { toast: { type: 'warning', content: '现在派不了，原因发在私聊里' } };
+    }
+    delete state.asks[v.id];
+    save();
+    const fail = (e) => post(`⚠️ 「${d.title}」没${d.kind === 'start' ? '派' : '发'}出去：${e?.message ?? e}`, null, dmChat()).catch(() => {});
+    if (yes && d.kind === 'start') startDispatched(d).catch(fail);
+    if (yes && d.kind === 'send') sendToTask(d).then((why) => why && fail(why), fail);
+    const head = d.kind === 'start' ? `📋 **派活：${d.title}**\n\n${clip(d.brief, 600)}` : `📋 **给「${d.title}」的追加指示**\n\n${clip(d.message, 600)}`;
+    const note = d.kind === 'start' ? (yes ? '✅ 已派出，在群里的同名话题里做' : '❌ 没派') : yes ? '✅ 已发送' : '❌ 没发';
+    return { toast: { type: yes ? 'success' : 'info', content: note.slice(2) }, card: { type: 'raw', data: JSON.parse(card(`${head}\n\n${note}`)) } };
+  }
+
+  async function taskTool(tool, a) {
+    switch (tool) {
+      case 'list_tasks': return { text: listTasks() };
+      case 'task_detail': return taskDetail(a.task);
+      case 'start_task': return requestDispatch(a);
+      case 'send_to_task': return requestSend(a);
+      case 'stop_task': {
+        const hit = findTask(a.task);
+        if (!hit) return notFound(a.task);
+        return { text: stopTask(hit[0]) ? `正在停止「${hit[1].title}」` : `「${hit[1].title}」现在没在跑` };
+      }
+    }
+    return { error: `没有这个工具：${tool}` };
+  }
+
+  fs.rmSync(TASK_SOCK, { force: true });
+  net.createServer({ allowHalfOpen: true }, (c) => {
+    let buf = '', done = false;
+    c.on('data', async (d) => {
+      buf += d;
+      if (done || !buf.includes('\n')) return;
+      done = true;
+      let r;
+      try {
+        const { tool, args } = JSON.parse(buf);
+        log('task tool', tool);
+        r = await taskTool(tool, args ?? {});
+      } catch (e) { r = { error: e.message }; }
+      c.end(JSON.stringify(r));
+    });
+    c.on('error', () => {});
+  }).listen(TASK_SOCK, () => fs.chmodSync(TASK_SOCK, 0o600));
+
   // ───── 图片 ─────
   // 手机发来的图片下载到 images/（留 7 天），在消息里附上路径让 Claude 用 Read 看
   async function fetchImages(m, keys) {
@@ -1083,6 +1400,7 @@ async function run() {
     if (!text) return post('暂时只支持文字和图片。', key);
 
     const id = state.roots[key];
+    if (id && state.sessions[id]) state.sessions[id].notify = false; // 你自己在话题里接着聊了，之后各轮不再往私聊报
     if (!id) {
       // 新话题：起一个命令行会话
       const nid = crypto.randomUUID();
@@ -1102,11 +1420,14 @@ async function run() {
   // ───── 私聊：直接和机器人聊，一条消息就是一个临时任务 ─────
   // 连着发接着同一个会话聊；/new 或空闲超过 dm_idle_minutes 后开新任务。
   // 私聊任务默认在 dm_workdir 里做（不配就是 workdir），/cd 换目录
-  const DM_HELP = [
-    '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
-    '`/new [内容]` 结束当前任务，开新任务',
-    '`/cd <别名或绝对路径> [内容]` 在指定目录开新任务',
-    '`/stop` 停止正在跑的任务（也可以点「工作中」卡片上的停止）',
+  const DM_HELP = () => [
+    secretaryOn()
+      ? '这里是你的秘书：一个一直开着的 Claude 会话。小事它自己做，大活它派到群里单独的话题里做（要你点「派」才开始），做完、出错、等你确认时这里会收到通知。'
+      : '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
+    ...(secretaryOn() ? ['`/tasks` 看派出去的任务和电脑上开着的会话'] : []),
+    `\`/new [内容]\` ${secretaryOn() ? '换一个新的秘书会话（派出去的任务不受影响）' : '结束当前任务，开新任务'}`,
+    `\`/cd <别名或绝对路径> [内容]\` 在指定目录开新${secretaryOn() ? '的秘书会话' : '任务'}`,
+    '`/stop` 停止正在跑的那一轮（也可以点「工作中」卡片上的停止）',
     '`/file <路径>` 把电脑上的文件发到这里；也可以直接让 Claude 发',
     '`/help` 显示这段说明',
   ].join('\n');
@@ -1117,12 +1438,16 @@ async function run() {
     const id = crypto.randomUUID();
     const cwd = state.dm.next_cwd ?? cfg.dm_workdir ?? cfg.workdir;
     delete state.dm.next_cwd;
-    Object.assign(session(id), { dm: m.chat_id, title: titleFrom(text), cwd, home: cwd });
+    const secretary = secretaryOn();
+    // 私聊归秘书：之前私聊开的普通任务（可能已导入桌面在接着用）以后的回复改发群里各自的话题，不再混进私聊
+    if (secretary) for (const [sid, o] of Object.entries(state.sessions)) if (o.dm && !o.secretary && !running.has(sid)) delete o.dm;
+    Object.assign(session(id), { dm: m.chat_id, title: secretary ? '秘书' : titleFrom(text), cwd, home: cwd, ...(secretary && { secretary: true }) });
     Object.assign(state.dm, { session: id, last: Date.now() });
     save();
     runCli(id, text, false);
     react(m.message_id);
-    await post(`🆕 新任务 · \`${tilde(cwd)}\`${cfg.desktop_import === false ? '' : '\n第一轮做完会出现在桌面版，可以在那边接着聊'}`, null, m.chat_id);
+    await post(secretary ? `🆕 新的秘书会话 · \`${tilde(cwd)}\`\n小事它自己做，大活派到群里单独的话题；\`/tasks\` 看任务，\`/help\` 看说明`
+      : `🆕 新任务 · \`${tilde(cwd)}\`${cfg.desktop_import === false ? '' : '\n第一轮做完会出现在桌面版，可以在那边接着聊'}`, null, m.chat_id);
   }
 
   async function onDirectMessage(m, text) {
@@ -1130,10 +1455,12 @@ async function run() {
     dm.chat_id = m.chat_id;
     const say = (md) => post(md, null, m.chat_id);
     if (!text) return say('暂时只支持文字和图片。');
-    const [, cmd, arg = ''] = text.match(/^\/(new|cd|help)(?:\s+([\s\S]*))?$/i) ?? [];
+    const [, cmd, arg = ''] = text.match(/^\/(new|cd|help|tasks)(?:\s+([\s\S]*))?$/i) ?? [];
     switch (cmd?.toLowerCase()) {
+      case 'tasks':
+        return say(listTasks());
       case 'help': // 「/help 你是谁」：先回说明，后面的内容照常当一条消息处理
-        await say(DM_HELP);
+        await say(DM_HELP());
         if (!arg.trim()) return;
         text = arg.trim();
         break;
@@ -1152,8 +1479,9 @@ async function run() {
         return rest.trim() ? startTask(m, rest.trim()) : say(`好，下一条消息在 \`${tilde(dir)}\` 开新任务。`);
       }
     }
+    // 秘书一直用同一个会话（之前私聊开的普通任务不算，第一次发消息时换成秘书）；关了秘书时按空闲时间切新任务
     const cur = dm.session && state.sessions[dm.session];
-    if (cur && Date.now() - (dm.last ?? 0) < idleMs()) {
+    if (cur && (secretaryOn() ? cur.secretary : Date.now() - (dm.last ?? 0) < idleMs())) {
       dm.last = Date.now();
       save();
       return resumeWith(dm.session, text, m, say);
@@ -1185,9 +1513,16 @@ async function run() {
         if (!stopTask(v.sid)) return { toast: { type: 'info', content: '这个任务已经结束了' } };
         return { toast: { type: 'success', content: '正在停止' }, ...(st && { card: { type: 'raw', data: JSON.parse(cardOf(statusCard(v.sid, st))) } }) };
       }
+      if (/^(no)?(dispatch|send)$/.test(v.a)) return answerAsk(v); // 秘书派活、递话的确认
+      if (v.a === 'desk') { // 做完通知上的「在桌面打开」
+        if (!state.sessions[v.sid]) return { toast: { type: 'info', content: '找不到这个会话' } };
+        if (running.has(v.sid)) return { toast: { type: 'warning', content: '还在跑，这一轮做完再开' } };
+        importToDesktop(v.sid).catch((e) => log('desktop import failed', v.sid.slice(0, 8), e.message));
+        return { toast: { type: 'success', content: '已在电脑的桌面版里打开' } };
+      }
       const p = prompts.get(v.id);
       if (!p) return { toast: { type: 'info', content: '这个请求已经结束了' } };
-      return p.click(v, data.action?.form_value ?? {});
+      return p.click(v, data.action?.form_value ?? {}, data.context?.open_message_id);
     },
     // 一键建的应用还订阅了表情事件，登记空处理，免得日志刷警告
     'im.message.reaction.created_v1': () => {},
