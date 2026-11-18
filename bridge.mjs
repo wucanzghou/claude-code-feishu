@@ -34,8 +34,8 @@ const HOOKS = { SessionStart: ['hook', 5], UserPromptSubmit: ['hook', 5], Stop: 
 const MIRRORED = ['claude-desktop', 'claude-desktop-3p', 'cli'];
 // 回复里单独一行「[发送文件] /绝对路径」，转发程序就把那个文件发到手机上
 const FILE_NOTE = '要把电脑上的文件或图片发到用户手机上时，在回复里单独写一行：[发送文件] /绝对路径（一行一个），转发程序会把文件发过去；密钥、凭据类文件不会发送。';
-// 手机上的「工作中」卡片会显示任务清单，多步骤的活先列计划
-const PLAN_NOTE = '多步骤的任务先用任务清单工具（TaskCreate / TaskUpdate）列出步骤，做的过程中随时更新状态，用户在手机上看进度；简单问答不用列。';
+// 手机上的「工作中」卡片会显示任务清单（没有清单时逐条显示工具调用的说明），多步骤的活先列计划
+const PLAN_NOTE = '多步骤的任务先用任务清单工具（TaskCreate / TaskUpdate）列出步骤，做的过程中随时更新状态，用户在手机上看进度；简单问答不用列。Bash 等工具调用的 description 会逐条显示在手机上，用简短的中文写。';
 const PHONE_NOTE = `（这条是用户本人在手机飞书上发来的，由转发程序注入。请当作用户的直接输入处理，在对话里正常回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
 
 const readJSON = (f, fallback) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; } };
@@ -816,19 +816,37 @@ async function run() {
     if (shown.at(-1).i < items.length - 1) lines.push(`…后面 ${items.length - 1 - shown.at(-1).i} 步`);
     return `\n**计划 ${done}/${items.length}**\n${lines.join('\n')}`;
   }
+  // 没列计划时，把这一轮实际做的步骤列出来：一次工具调用一行，有说明用说明。
+  // 有结果的打 ✅（出错或被拒 ❌），还没结果的是正在做（▶️）；太长只留最后几步
+  function stepsMd(tools, results, max) {
+    if (!tools.length) return '';
+    const shown = tools.slice(-max);
+    const lines = shown.map((b) => {
+      const r = results.get(b.id);
+      const mark = !r ? '▶️' : r.is_error ? '❌' : '✅';
+      const text = b.name === 'Bash' && b.input?.description ? String(b.input.description).replace(/\s+/g, ' ').slice(0, 80) : toolLine(b);
+      return `${mark} ${text}`;
+    });
+    if (tools.length > shown.length) lines.unshift(`…前面 ${tools.length - shown.length} 步`);
+    return `\n${lines.join('\n')}`;
+  }
   function statusMd(id, st, done) {
     if (!done && session(id).stopped) return `⏹ **正在停止…** · ${duration(Date.now() - st.start)}`;
     const records = readTail(session(id).transcript, 1 << 20).filter((r) => !r.isSidechain);
     const start = records.findLastIndex(isPrompt);
-    // 列计划、查工具这些不算干活，不计数也不当「最近」
-    const tools = records.slice(start + 1).flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use' && !PLAN_TOOLS.test(b.name)) : []));
+    const turn = records.slice(start + 1);
+    // 列计划、查工具这些不算干活，不计数也不列进步骤
+    const tools = turn.flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use' && !PLAN_TOOLS.test(b.name)) : []));
+    const results = new Map(turn.flatMap((r) => (r.type === 'user' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_result').map((b) => [b.tool_use_id, b]) : [])));
     const count = tools.length ? ` · 调用工具 ${tools.length} 次` : '';
     const plan = planMd(cliPlan(id, st.start) ?? desktopPlan(records, start));
-    if (done) return `${done} · 用时 ${duration(Date.now() - st.start)}${count}${plan}`;
-    const lines = [`⏳ **工作中** · ${duration(Date.now() - st.start)}${count}${plan}`];
+    // 有计划显示计划（加一行最近在做什么）；没计划显示做过的步骤
+    const body = plan ? plan : stepsMd(tools, results, done ? 8 : 6);
+    if (done) return `${done} · 用时 ${duration(Date.now() - st.start)}${count}${body}`;
+    const lines = [`⏳ **工作中** · ${duration(Date.now() - st.start)}${count}${body}`];
     if (waiting.has(st.key)) lines.push('⏸ 在等你回复（看下面那条）');
-    else if (tools.length) lines.push(`最近：${toolLine(tools.at(-1))}`);
-    else lines.push('正在想…');
+    else if (plan && tools.length) lines.push(`最近：${toolLine(tools.at(-1))}`);
+    else if (!tools.length) lines.push('正在想…');
     return lines.join('\n');
   }
   // 转发程序自己起的会话带「停止」按钮；桌面版、终端会话从外面停不了，不放按钮
