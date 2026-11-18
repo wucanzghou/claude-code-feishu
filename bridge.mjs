@@ -270,6 +270,19 @@ async function run() {
     } catch { return []; }
   }
   const sizeOf = (file) => { try { return fs.statSync(file).size; } catch { return 0; } };
+  // 会话起步的目录：对话文件里第一条带 cwd 的记录（老会话没记 home 时用）
+  function firstCwd(file) {
+    try {
+      const fd = fs.openSync(file, 'r');
+      const buf = Buffer.alloc(256 << 10);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      fs.closeSync(fd);
+      for (const l of buf.toString('utf8', 0, n).split('\n')) {
+        try { const cwd = JSON.parse(l).cwd; if (typeof cwd === 'string' && cwd) return cwd; } catch {}
+      }
+    } catch {}
+    return undefined;
+  }
   // 会话标题：桌面版和终端都会往对话文件里写 custom-title / ai-title
   const titleOf = (records) => records.findLast((r) => r.customTitle)?.customTitle ?? records.findLast((r) => r.aiTitle)?.aiTitle;
   // 用户输入（一轮的开头）：真人打的字或排队进来的消息，不算工具结果
@@ -310,7 +323,12 @@ async function run() {
 
   async function handleEvent(ev) {
     const s = session(ev.session_id);
-    if (ev.cwd) s.cwd = ev.cwd;
+    // cwd 是会话眼下所在的目录（Claude 用 cd 换过就跟着变，发文件按它算相对路径）；
+    // home 是会话起步的目录，续跑时回到这里，项目 .claude/ 里的放行规则才加载得上
+    if (ev.cwd) {
+      s.cwd = ev.cwd;
+      s.home ??= ev.cwd;
+    }
     if (ev.transcript) s.transcript = ev.transcript;
     if (ev.desktop) s.desktop = true;
     if (ev.socket && ev.token) Object.assign(s, { socket: ev.socket, token: ev.token });
@@ -417,8 +435,9 @@ async function run() {
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id, '--replay-user-messages',
       '--append-system-prompt', `用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。${PLAN_NOTE}${FILE_NOTE}`];
-    const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
-    log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', s.cwd);
+    const dir = (s.home ??= firstCwd(s.transcript) ?? s.cwd ?? cfg.workdir);
+    const child = spawn(cfg.claude, args, { cwd: dir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+    log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', dir);
     const send = (o) => child.stdin.writable && child.stdin.write(JSON.stringify(o) + '\n');
     child.stdin.on('error', () => {});
     // sent / taken：写进去几条、CLI 开始处理（回显）了几条。全都处理完的那次 result 才关输入，
@@ -1067,7 +1086,7 @@ async function run() {
     if (!id) {
       // 新话题：起一个命令行会话
       const nid = crypto.randomUUID();
-      Object.assign(session(nid), { root: key, title: titleFrom(text), cwd: cfg.workdir });
+      Object.assign(session(nid), { root: key, title: titleFrom(text), cwd: cfg.workdir, home: cfg.workdir });
       state.roots[key] = nid;
       save();
       runCli(nid, text, false);
@@ -1098,7 +1117,7 @@ async function run() {
     const id = crypto.randomUUID();
     const cwd = state.dm.next_cwd ?? cfg.dm_workdir ?? cfg.workdir;
     delete state.dm.next_cwd;
-    Object.assign(session(id), { dm: m.chat_id, title: titleFrom(text), cwd });
+    Object.assign(session(id), { dm: m.chat_id, title: titleFrom(text), cwd, home: cwd });
     Object.assign(state.dm, { session: id, last: Date.now() });
     save();
     runCli(id, text, false);
