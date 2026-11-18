@@ -509,11 +509,15 @@ async function run() {
       await drain(); // 先把钩子事件读完，拿到最新的收件地址
       if (s.socket && s.token && alive(s.socket)) {
         s.pending.push(text);
+        // 手机发起的这一轮还在跑（卡片还在）：桌面版会把它插进当前这一轮，接着用原来的「工作中」卡片
+        const mid = status.has(id);
+        if (mid) (s.midturn ??= []).push(text);
         if (await deliver(s, text)) {
           save();
           return react(m.message_id);
         }
         s.pending.pop();
+        if (mid) s.midturn.pop();
         return say('没送进去：这个会话的进程还开着，但没收到这条。稍后再发一次。');
       }
       Object.assign(s, { socket: undefined, token: undefined }); // 进程已经退了（没赶上报 SessionEnd 时）
