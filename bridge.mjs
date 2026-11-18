@@ -147,7 +147,7 @@ async function registerApp() {
 
 // ───────── install / uninstall ─────────
 
-function install() {
+async function install() {
   if (!fs.existsSync(CONFIG)) throw new Error('先运行 setup');
   const settings = stripHooks(readJSON(SETTINGS, {}));
   for (const [e, [sub, timeout]] of Object.entries(HOOKS))
@@ -169,8 +169,11 @@ function install() {
   <key>StandardErrorPath</key><string>${out}</string>
 </dict></plist>
 `);
-  launchctl('bootout', `gui/${process.getuid()}/${LABEL}`);
-  launchctl('bootstrap', `gui/${process.getuid()}`, PLIST);
+  const service = `gui/${process.getuid()}/${LABEL}`;
+  launchctl('bootout', service);
+  // bootout 是异步的：旧进程没退干净就 bootstrap 会失败，等它退完再注册
+  for (let i = 0; i < 50 && launchctl('print', service); i++) await sleep(100);
+  if (!launchctl('bootstrap', `gui/${process.getuid()}`, PLIST)) throw new Error(`启动失败，手动试试：launchctl bootstrap gui/${process.getuid()} ${PLIST}`);
   console.log(`已启动并设为开机自启：${LABEL}，日志 ${out}`);
 }
 
@@ -191,7 +194,7 @@ function stripHooks(settings) {
 }
 
 function launchctl(...args) {
-  try { execFileSync('launchctl', args, { stdio: 'ignore' }); } catch {}
+  try { execFileSync('launchctl', args, { stdio: 'ignore' }); return true; } catch { return false; }
 }
 
 // ───────── 转发程序 ─────────
