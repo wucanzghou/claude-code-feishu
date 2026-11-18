@@ -79,6 +79,18 @@ node bridge.mjs install
 - **手机上看到的是每轮的最终文字**，工具调用和中间过程不转发；超过 12000 字分几条发。暂时只收文字消息。
 - **Mac 睡眠时离线**。转发程序没在跑或断网时，钩子事件攒在 `events/` 里，恢复后按顺序补发（超过一小时的丢弃）。想一直在线，可以 `sudo pmset -c sleep 0`（接电源时不睡）。
 - **Claude Code 升级后收件协议如果变了**（现在是 `type:auth` 和 `type:user` 两行 JSON），注入会失败，机器人会回「没在运行」，所以失效时看得出来。这是未公开的内部机制，2.1.3xx 实测可用。
+- **手机开的会话用的是命令行 `claude` 的登录**，和桌面版分开。命令行登录过期时，新会话第一句就报 `Failed to authenticate`，在终端里 `claude auth login` 重新登录即可。
+
+## 私聊：不进群，直接和机器人聊
+
+在飞书里点开机器人发私信，不用开话题。适合查个数、问个问题这种做完就扔的临时任务。
+
+- **一条消息就是一个任务**，用命令行会话（`claude -p`）去做，回复直接回到私聊。
+- **连着发会接着聊**；空闲超过 `dm_idle_minutes`（默认 30 分钟）再发，自动开新任务。上一条还没跑完时发的消息先排队，跑完合成一条接着续。
+- **私聊任务在 `dm_workdir` 里做**（不配就是 `workdir`）。建议直接配成项目根目录：项目 `.claude/` 里的放行规则只在工作目录那一层生效，放到项目的子目录里就够不着了。
+- 指令：`/new [内容]` 开新任务，`/cd <别名或绝对路径> [内容]` 在指定目录开新任务（别名配在 `projects`），`/help`。
+- 任务导入桌面版后（File → Import Claude Code CLI Sessions…）就是桌面会话：桌面开着时私聊消息注入进去，没开着会提示，不另起进程续。
+- 和群里一样只认 `owner_open_id`，别人私聊机器人一律忽略。
 
 ## 安全边界
 
@@ -101,8 +113,12 @@ node bridge.mjs install
 | `claude` | `claude` 命令的路径，手机开新会话时用 |
 | `workdir` | 手机开新会话的工作目录，默认家目录 |
 | `permission_mode` | 手机开新会话的权限模式，默认 `bypassPermissions` |
+| `dm_workdir` | 私聊任务的工作目录，默认同 `workdir`（可选） |
+| `dm_idle_minutes` | 私聊空闲多久后开新任务，默认 30（可选） |
+| `dm_permission_mode` | 私聊任务单独的权限模式，不填沿用 `permission_mode`（可选） |
+| `projects` | `/cd` 用的目录别名，如 `{"web": "/path/to/repo"}`（可选） |
 
-同目录下还有 `state.json`（会话 ↔ 话题映射）、`events/`（钩子投递的事件）、`bridge.log`。
+同目录下还有 `state.json`（会话 ↔ 话题映射）、`events/`（钩子投递的事件）、`bridge.log`（含每条收到的消息 ID 和长连接重连记录，丢消息时先看这里）。
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.github.claude-code-feishu   # 重启
@@ -141,7 +157,7 @@ Field notes:
 - If a desktop session's process has exited there is no socket; the bot asks you to reopen it rather than forking the conversation. Terminal and phone-started sessions resume with `claude -p --resume`.
 - This relies on an undocumented internal protocol (tested on Claude Code 2.1.3xx). If it changes, the bot reports the session as not running.
 
-Only the group owner's messages are accepted. Phone-started sessions default to `bypassPermissions`; change `permission_mode` in `~/.claude/feishu-bridge/config.json` to tighten it.
+Direct messages to the bot work too: each DM starts a throwaway `claude -p` task in `dm_workdir`, consecutive messages continue it, and `/new`, `/cd`, `/help` manage it. Only the owner's messages are accepted, in the group or in DMs. Phone-started sessions default to `bypassPermissions`; change `permission_mode` in `~/.claude/feishu-bridge/config.json` to tighten it.
 
 ## License
 

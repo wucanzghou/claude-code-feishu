@@ -9,6 +9,7 @@
 // 桌面 → 手机：钩子把会话事件写进 events/，转发程序读对话文件，把每轮回复贴进该会话的话题
 // 手机 → 桌面：话题里的回复经会话自带的收件 socket，注入正在运行的那个会话
 // 手机开新话题：起一个命令行会话（claude -p）去做，同一话题里接着聊
+// 私聊机器人：不进群，一条消息就是一个临时任务（claude -p），在 dm_workdir 里做，连着发接着聊
 import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -190,10 +191,11 @@ async function run() {
   const session = (id) => (state.sessions[id] ??= { posted: [], pending: [] });
 
   const card = (md) => JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: md }] } });
-  async function post(md, root) {
+  // 有 root 就回进群里那个话题；否则发到 chat（默认话题群，私聊会话传私聊的 chat_id）
+  async function post(md, root, chat = cfg.chat_id) {
     const res = root
       ? await client.im.v1.message.reply({ path: { message_id: root }, data: { msg_type: 'interactive', content: card(md), reply_in_thread: true } })
-      : await client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: cfg.chat_id, msg_type: 'interactive', content: card(md) } });
+      : await client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chat, msg_type: 'interactive', content: card(md) } });
     if (res.code !== 0) throw new Error(`feishu ${res.code} ${res.msg}`);
     return res.data.message_id;
   }
@@ -256,15 +258,18 @@ async function run() {
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
       const i = s.pending.findIndex((t) => ev.prompt.includes(t));
       if (i >= 0) s.pending.splice(i, 1); // 手机发来的，不回显
+      else if (s.dm) await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, null, s.dm);
       else await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, await topic(ev.session_id, titleOf(readTail(s.transcript)), ev.prompt.slice(0, 40)));
     }
     if (ev.event === 'Stop' && s.transcript) {
       await sleep(800); // 等对话文件写完
       const records = readTail(s.transcript);
       const texts = turnTexts(records, s.posted);
-      const root = await topic(ev.session_id, titleOf(records));
+      // 私聊里开的会话回私聊，其余回群里各自的话题
+      const root = s.dm ? null : await topic(ev.session_id, titleOf(records));
       const md = texts.map((t) => t.text).join('\n\n');
-      for (let i = 0; i < md.length; i += 12000) await post(md.slice(i, i + 12000), root); // 卡片有长度上限
+      for (let i = 0; i < md.length; i += 12000) await post(md.slice(i, i + 12000), root, s.dm); // 卡片有长度上限
+      if (s.dm && state.dm?.session === ev.session_id) state.dm.last = Date.now(); // 空闲从回完这一轮算起
       s.posted = [...s.posted, ...texts.map((t) => t.uuid)].slice(-300);
     }
     save();
@@ -302,24 +307,49 @@ async function run() {
     return false;
   }
 
+  // 同一会话同一时刻只跑一个 claude -p：上一条没跑完时后来的消息先排队，跑完合成一条再续，
+  // 免得两个 --resume 并行把一份对话分叉成两份
+  const running = new Map(); // sessionId -> 排队中的消息
+  // 在某个 Claude Code 会话里手动起转发程序时，会继承那个会话的入口、收件 socket、API 地址等环境变量；
+  // 原样传给 claude -p，钩子会把它当成那个会话（桌面版）的事件。launchd 起的没有这些，不受影响
+  function childEnv() {
+    const env = { ...process.env, FEISHU_BRIDGE_CHILD: '1' };
+    if (process.env.CLAUDECODE) for (const k of Object.keys(env)) if (/^(CLAUDE|MCP_|ANTHROPIC_BASE_URL$)/.test(k)) delete env[k];
+    return env;
+  }
   function runCli(id, text, resume) {
+    if (running.has(id)) return running.get(id).push(text);
+    running.set(id, []);
     const s = session(id);
     s.pending.push(text);
-    const args = ['-p', text, '--permission-mode', cfg.permission_mode, resume ? '--resume' : '--session-id', id];
-    const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: { ...process.env, FEISHU_BRIDGE_CHILD: '1' }, stdio: ['ignore', 'ignore', 'pipe'] });
+    const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
+    const args = ['-p', text, '--permission-mode', mode, resume ? '--resume' : '--session-id', id];
+    const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['ignore', 'ignore', 'pipe'] });
+    log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', s.cwd);
     let err = '';
     child.stderr.on('data', (d) => (err = (err + d).slice(-1500)));
-    child.on('exit', (code) => code && post(`⚠️ 命令行会话退出（${code}）\n\n${err}`, s.root).catch(() => {}));
+    child.on('error', (e) => (err += e.message));
+    child.on('close', (code) => { // 进程没能起来（error）时也会触发 close
+      log('cli exit', id.slice(0, 8), code);
+      if (code) post(`⚠️ 命令行会话退出（${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
+      const queued = running.get(id);
+      running.delete(id);
+      if (queued.length) runCli(id, queued.join('\n\n'), true);
+    });
   }
 
   async function onPhoneMessage({ message: m, sender }) {
-    if (m.chat_id !== cfg.chat_id || sender?.sender_id?.open_id !== cfg.owner_open_id) return; // 只认群主本人
+    // 只认本人：别人私聊机器人也能在这台电脑上跑 Claude，所以私聊和群里一样先核对发送人
+    if (sender?.sender_id?.open_id !== cfg.owner_open_id) return log('ignored: not owner', m.message_id);
+    const dm = m.chat_type === 'p2p';
+    if (!dm && m.chat_id !== cfg.chat_id) return log('ignored: other chat', m.chat_id);
     let text = '';
     try {
       const c = JSON.parse(m.content);
       text = m.message_type === 'text' ? c.text : (c.content ?? []).flat().map((x) => x.text ?? '').join('');
     } catch {}
     text = text.replace(/@_user_\d+/g, '').trim();
+    if (dm) return onDirectMessage(m, text);
     const key = m.root_id || m.message_id;
     if (!text) return post('暂时只支持文字消息。', key);
 
@@ -349,18 +379,98 @@ async function run() {
     react(m.message_id);
   }
 
+  // ───── 私聊：直接和机器人聊，一条消息就是一个临时任务 ─────
+  // 连着发接着同一个会话聊；/new 或空闲超过 dm_idle_minutes 后开新任务。
+  // 私聊任务默认在 dm_workdir 里做（不配就是 workdir），/cd 换目录
+  const DM_HELP = [
+    '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
+    '`/new [内容]` 结束当前任务，开新任务',
+    '`/cd <别名或绝对路径> [内容]` 在指定目录开新任务',
+    '`/help` 显示这段说明',
+  ].join('\n');
+  const idleMs = () => (cfg.dm_idle_minutes ?? 30) * 60e3;
+  const tilde = (p) => p.replace(os.homedir(), '~');
+
+  async function startTask(m, text) {
+    const id = crypto.randomUUID();
+    const cwd = state.dm.next_cwd ?? cfg.dm_workdir ?? cfg.workdir;
+    delete state.dm.next_cwd;
+    Object.assign(session(id), { dm: m.chat_id, title: text.slice(0, 40), cwd });
+    Object.assign(state.dm, { session: id, last: Date.now() });
+    save();
+    runCli(id, text, false);
+    react(m.message_id);
+    await post(`🆕 新任务 · \`${tilde(cwd)}\``, null, m.chat_id);
+  }
+
+  async function onDirectMessage(m, text) {
+    const dm = (state.dm ??= {});
+    dm.chat_id = m.chat_id;
+    const say = (md) => post(md, null, m.chat_id);
+    if (!text) return say('暂时只支持文字消息。');
+    const [, cmd, arg = ''] = text.match(/^\/(new|cd|help)(?:\s+([\s\S]*))?$/i) ?? [];
+    switch (cmd?.toLowerCase()) {
+      case 'help': // 「/help 你是谁」：先回说明，后面的内容照常当一条消息处理
+        await say(DM_HELP);
+        if (!arg.trim()) return;
+        text = arg.trim();
+        break;
+      case 'new':
+        dm.session = null;
+        save();
+        return arg.trim() ? startTask(m, arg.trim()) : say('好，下一条消息开新任务。');
+      case 'cd': {
+        const [, where = '', rest = ''] = arg.match(/^(\S*)\s*([\s\S]*)$/) ?? [];
+        const dir = cfg.projects?.[where] ?? (path.isAbsolute(where) ? where : '');
+        if (!dir || !fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory())
+          return say(`没有这个目录或别名：${where || '（空）'}\n可用别名：${Object.keys(cfg.projects ?? {}).join(' / ') || '无（在 config.json 的 projects 里配）'}`);
+        dm.session = null;
+        dm.next_cwd = dir;
+        save();
+        return rest.trim() ? startTask(m, rest.trim()) : say(`好，下一条消息在 \`${tilde(dir)}\` 开新任务。`);
+      }
+    }
+    const cur = dm.session && state.sessions[dm.session];
+    if (cur && Date.now() - (dm.last ?? 0) < idleMs()) {
+      dm.last = Date.now();
+      save();
+      // 任务导入桌面版后就是桌面会话：开着就注入进去，没开着不另起进程去续，免得一份对话分叉成两份
+      if (cur.desktop) {
+        await drain();
+        if (cur.socket && cur.token) {
+          cur.pending.push(text);
+          if (await deliver(cur, text)) {
+            save();
+            return react(m.message_id);
+          }
+          cur.pending.pop();
+        }
+        return say('这个任务已经在桌面版里打开过，目前没在运行。请在桌面打开它后再发一次，或发 /new 开新任务。');
+      }
+      runCli(dm.session, text, true); // 上一条还在跑就排队
+      return react(m.message_id);
+    }
+    return startTask(m, text);
+  }
+
   const seen = new Set();
   const dispatcher = new lark.EventDispatcher({}).register({
     'im.message.receive_v1': (data) => {
-      if (seen.has(data.message.message_id)) return; // 飞书偶尔重复推送
-      seen.add(data.message.message_id);
+      const m = data.message;
+      // 收到什么先记一笔（不记内容），丢消息时才查得出是飞书没推还是这里过滤掉了
+      log('recv', m.chat_type, m.message_type, m.message_id, m.root_id ? 'in ' + m.root_id : '');
+      if (seen.has(m.message_id)) return; // 飞书偶尔重复推送
+      seen.add(m.message_id);
       onPhoneMessage(data).catch((e) => log('phone message failed', e.message));
     },
     // 一键建的应用还订阅了表情事件，登记空处理，免得日志刷警告
     'im.message.reaction.created_v1': () => {},
     'im.message.reaction.deleted_v1': () => {},
   });
-  new lark.WSClient({ ...opts, loggerLevel: lark.LoggerLevel.warn }).start({ eventDispatcher: dispatcher });
+  // info 级别只多出连上/重连两类日志，带上时间才能和丢消息的时间对上
+  const stamped = (fn) => (msg) => fn(new Date().toISOString(), ...msg);
+  const logger = { error: stamped(console.error), warn: stamped(console.warn), info: stamped(console.log), debug: stamped(console.log), trace: stamped(console.log) };
+  new lark.WSClient({ ...opts, loggerLevel: lark.LoggerLevel.info, logger }).start({ eventDispatcher: dispatcher });
 
   fs.mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
   fs.watch(EVENTS, drain);
