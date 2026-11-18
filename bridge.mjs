@@ -110,6 +110,7 @@ async function hook() {
     const ev = {
       event: d.hook_event_name, session_id: d.session_id, transcript: d.transcript_path, cwd: d.cwd, prompt: d.prompt,
       desktop: entry.startsWith('claude-desktop'),
+      at: Date.now(), // 钩子触发的时刻：Stop 时用来分清哪些记录属于刚做完的这一轮
       // 收件地址和令牌只在会话子进程的环境里有，钩子正好是子进程
       socket: process.env.CLAUDE_CODE_MESSAGING_SOCKET, token: process.env.CLAUDE_CODE_MESSAGING_TOKEN,
     };
@@ -375,9 +376,12 @@ async function run() {
       (r.type === 'attachment' && r.attachment?.type === 'queued_command');
   }
   // 本轮（最后一个用户输入之后）还没发过的助手文字
-  function turnTexts(records, posted) {
+  // until：Stop 钩子触发的时刻。之后才写进来的记录属于下一轮（后台命令跑完自动开的那一轮、排着的消息），
+  // 留给下一轮发；不截的话，下一轮的提问会把这一轮的回复清掉，这一轮的回复就丢了
+  function turnTexts(records, posted, until) {
     let out = [];
     for (const r of records) {
+      if (until && r.timestamp && Date.parse(r.timestamp) > until) break;
       if (r.isSidechain) continue;
       const c = r.message?.content;
       if (isPrompt(r) && r.type === 'user') out = []; // 插话（queued_command）不算新一轮，前面说的话照样发
@@ -449,7 +453,7 @@ async function run() {
       const took = status.get(ev.session_id)?.start;
       await finishStatus(ev.session_id, s.stopped ? '⏹ 已停止' : '✅ 完成');
       const records = readTail(s.transcript);
-      const texts = turnTexts(records, s.posted);
+      const texts = turnTexts(records, s.posted, ev.at);
       // 私聊里开的会话回私聊，其余回群里各自的话题
       const root = s.dm ? null : await topic(ev.session_id, titleOf(records));
       const files = [];
@@ -1132,6 +1136,42 @@ async function run() {
     ].join('\n');
   }
 
+  // 秘书一直用同一个会话，每条消息都要把整段历史重读一遍，越聊越贵。隔了天（早上 4 点算新一天），
+  // 或上下文超过 secretary_max_context（默认 8 万 token，0 = 不按大小换）就换一个新秘书，
+  // 交接不靠模型总结：转发程序把任务清单和最近几句对话塞进新秘书的第一条消息
+  const HANDOFF_END = '——以上是交接，下面是用户刚发来的消息——';
+  function contextTokens(file) {
+    const recs = readTail(file, 1 << 20);
+    for (let i = recs.length - 1; i >= 0; i--) {
+      const u = recs[i].type === 'assistant' && !recs[i].isSidechain && recs[i].message?.usage;
+      if (u) return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+    }
+    return 0;
+  }
+  function secretaryStale(s, last) {
+    const day = (t) => new Date(t - 4 * 3600e3).toDateString();
+    if (last && day(last) !== day(Date.now())) return '隔了一天';
+    const max = Number(cfg.secretary_max_context ?? 80000);
+    const ctx = max > 0 ? contextTokens(s.transcript) : 0;
+    return ctx > max ? `上下文约 ${(ctx / 1e4).toFixed(1)} 万 token` : null;
+  }
+  function handoffNote(oldId, why) {
+    const rounds = [];
+    for (const r of readTail(state.sessions[oldId]?.transcript, 2 << 20)) {
+      if (r.isSidechain) continue;
+      const c = r.message?.content;
+      const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b.type === 'text').map((b) => b.text).join('\n') : '';
+      if (isPrompt(r) && r.type === 'user' && !/^\s*<task-notification>/.test(text)) rounds.push({ q: text.split(HANDOFF_END).pop().trim(), a: [] });
+      else if (r.type === 'assistant' && text.trim() && rounds.length) rounds.at(-1).a.push(text.trim());
+    }
+    const recent = rounds.slice(-3).map((t) => `用户：${clip(t.q.replace(/\s+/g, ' '), 300)}\n秘书：${clip(t.a.join(' ').replace(/\s+/g, ' '), 600) || '（没回复）'}`);
+    return [
+      `【交接】上一个秘书会话因为${why}自动换成了你，之前聊的细节你不记得了。下面是转发程序整理的交接，要最新情况用 list_tasks / task_detail 查；`,
+      '用户说起你不知道的事，直说不记得并请他补一句，不要猜。', '', listTasks(),
+      ...(recent.length ? ['', '最近几句对话：', ...recent] : []), '', HANDOFF_END, '',
+    ].join('\n');
+  }
+
   function taskDetail(ref) {
     const hit = findTask(ref, true);
     if (!hit) return notFound(ref);
@@ -1434,9 +1474,10 @@ async function run() {
   const idleMs = () => (cfg.dm_idle_minutes ?? 30) * 60e3;
   const tilde = (p) => p.replace(os.homedir(), '~');
 
-  async function startTask(m, text) {
+  // renew：秘书自动换新时 { from: 旧秘书, why }，新秘书接着在旧秘书的目录里，第一条消息前面带交接
+  async function startTask(m, text, renew) {
     const id = crypto.randomUUID();
-    const cwd = state.dm.next_cwd ?? cfg.dm_workdir ?? cfg.workdir;
+    const cwd = (renew && state.sessions[renew.from]?.home) ?? state.dm.next_cwd ?? cfg.dm_workdir ?? cfg.workdir;
     delete state.dm.next_cwd;
     const secretary = secretaryOn();
     // 私聊归秘书：之前私聊开的普通任务（可能已导入桌面在接着用）以后的回复改发群里各自的话题，不再混进私聊
@@ -1444,8 +1485,9 @@ async function run() {
     Object.assign(session(id), { dm: m.chat_id, title: secretary ? '秘书' : titleFrom(text), cwd, home: cwd, ...(secretary && { secretary: true }) });
     Object.assign(state.dm, { session: id, last: Date.now() });
     save();
-    runCli(id, text, false);
+    runCli(id, renew ? handoffNote(renew.from, renew.why) + text : text, false);
     react(m.message_id);
+    if (renew) return post(`🔄 秘书换新了（${renew.why}），任务清单和最近几句对话已交给新秘书；更早聊过的细节它不记得，要用就再说一遍`, null, m.chat_id);
     await post(secretary ? `🆕 新的秘书会话 · \`${tilde(cwd)}\`\n小事它自己做，大活派到群里单独的话题；\`/tasks\` 看任务，\`/help\` 看说明`
       : `🆕 新任务 · \`${tilde(cwd)}\`${cfg.desktop_import === false ? '' : '\n第一轮做完会出现在桌面版，可以在那边接着聊'}`, null, m.chat_id);
   }
@@ -1482,6 +1524,9 @@ async function run() {
     // 秘书一直用同一个会话（之前私聊开的普通任务不算，第一次发消息时换成秘书）；关了秘书时按空闲时间切新任务
     const cur = dm.session && state.sessions[dm.session];
     if (cur && (secretaryOn() ? cur.secretary : Date.now() - (dm.last ?? 0) < idleMs())) {
+      // 秘书正在跑这一轮时不换，消息照常插进去
+      const why = cur.secretary && !running.has(dm.session) && secretaryStale(cur, dm.last);
+      if (why) return startTask(m, text, { from: dm.session, why });
       dm.last = Date.now();
       save();
       return resumeWith(dm.session, text, m, say);
