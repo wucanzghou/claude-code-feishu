@@ -350,6 +350,7 @@ async function run() {
     running.set(id, []);
     const s = session(id);
     s.pending.push(text);
+    if (!resume && cfg.desktop_import !== false) s.to_desktop = true;
     const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
     const args = ['-p', text, '--permission-mode', mode, resume ? '--resume' : '--session-id', id];
     const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['ignore', 'ignore', 'pipe'] });
@@ -362,8 +363,51 @@ async function run() {
       if (code) post(`⚠️ 命令行会话退出（${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
       const queued = running.get(id);
       running.delete(id);
-      if (queued.length) runCli(id, queued.join('\n\n'), true);
+      if (queued.length) return runCli(id, queued.join('\n\n'), true);
+      if (!code && s.to_desktop) importToDesktop(id).catch((e) => log('desktop import failed', id.slice(0, 8), e.message));
     });
+  }
+
+  // 手机开的会话，命令行跑完第一轮后导入桌面版：先在对话文件末尾写上标题（和 /rename 写的是同一种记录），
+  // 再用桌面版自己的 claude://resume 深链接导入。桌面版只登记会话并切到它，不起进程；
+  // 之后在桌面里接着聊，就是同一个会话 id 的桌面会话
+  async function importToDesktop(id) {
+    const s = session(id);
+    delete s.to_desktop;
+    save();
+    await drain(); // 拿到钩子报上来的对话文件路径
+    if (!s.transcript || !fs.existsSync(s.transcript)) return log('desktop import skipped: no transcript', id.slice(0, 8));
+    fs.appendFileSync(s.transcript, JSON.stringify({ type: 'custom-title', customTitle: `📱 ${s.title}`, sessionId: id }) + '\n');
+    await new Promise((resolve) =>
+      spawn('/usr/bin/open', ['-g', `claude://resume?session=${id}`], { stdio: 'ignore' }).on('close', resolve).on('error', resolve));
+    log('desktop import', id.slice(0, 8));
+  }
+
+  // 接着一个已有会话聊：命令行还在跑就排队；有进程开着（桌面版或命令行）就注入；
+  // 进程已经没了就用命令行续上。桌面版下次接着聊时按会话 id 从对话文件续，命令行续的那几轮也在里面
+  const alive = (sock) => {
+    const pid = Number(path.basename(sock, '.sock'));
+    if (!fs.existsSync(sock)) return false;
+    if (!pid) return true;
+    try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  };
+  async function resumeWith(id, text, m, say) {
+    const s = session(id);
+    if (!running.has(id)) {
+      await drain(); // 先把钩子事件读完，拿到最新的收件地址
+      if (s.socket && s.token && alive(s.socket)) {
+        s.pending.push(text);
+        if (await deliver(s, text)) {
+          save();
+          return react(m.message_id);
+        }
+        s.pending.pop();
+        return say('没送进去：这个会话的进程还开着，但没收到这条。稍后再发一次。');
+      }
+      Object.assign(s, { socket: undefined, token: undefined }); // 进程已经退了（没赶上报 SessionEnd 时）
+    }
+    runCli(id, text, true); // 上一条还在跑就排队
+    react(m.message_id);
   }
 
   // ───── 手机审批 ─────
@@ -500,27 +544,18 @@ async function run() {
     if (!id) {
       // 新话题：起一个命令行会话
       const nid = crypto.randomUUID();
-      Object.assign(session(nid), { root: key, title: text.slice(0, 40), cwd: cfg.workdir });
+      Object.assign(session(nid), { root: key, title: titleFrom(text), cwd: cfg.workdir });
       state.roots[key] = nid;
       save();
       runCli(nid, text, false);
       return react(m.message_id);
     }
-    const s = session(id);
-    await drain(); // 先把钩子事件读完，拿到最新的收件地址
-    if (s.socket && s.token) {
-      s.pending.push(text);
-      if (await deliver(s, text)) {
-        save();
-        return react(m.message_id);
-      }
-      s.pending.pop();
-    }
-    // 桌面会话没在运行：不另起进程去续，免得一份对话分叉成两份
-    if (s.desktop) return post('这个会话在桌面版里，目前没在运行。请在桌面打开它，之后在这里再发一次即可。', key);
-    runCli(id, text, true);
-    react(m.message_id);
+    return resumeWith(id, text, m, (md) => post(md, key));
   }
+
+  // 会话标题取第一行文字；只发了图片时叫「图片」
+  const titleFrom = (text) =>
+    text.split('\n').find((l) => l.trim() && !l.startsWith('[图片]') && !l.startsWith('（手机发来的图片'))?.trim().slice(0, 40) || '图片';
 
   // ───── 私聊：直接和机器人聊，一条消息就是一个临时任务 ─────
   // 连着发接着同一个会话聊；/new 或空闲超过 dm_idle_minutes 后开新任务。
@@ -538,12 +573,12 @@ async function run() {
     const id = crypto.randomUUID();
     const cwd = state.dm.next_cwd ?? cfg.dm_workdir ?? cfg.workdir;
     delete state.dm.next_cwd;
-    Object.assign(session(id), { dm: m.chat_id, title: text.slice(0, 40), cwd });
+    Object.assign(session(id), { dm: m.chat_id, title: titleFrom(text), cwd });
     Object.assign(state.dm, { session: id, last: Date.now() });
     save();
     runCli(id, text, false);
     react(m.message_id);
-    await post(`🆕 新任务 · \`${tilde(cwd)}\``, null, m.chat_id);
+    await post(`🆕 新任务 · \`${tilde(cwd)}\`${cfg.desktop_import === false ? '' : '\n第一轮做完会出现在桌面版，可以在那边接着聊'}`, null, m.chat_id);
   }
 
   async function onDirectMessage(m, text) {
@@ -577,21 +612,7 @@ async function run() {
     if (cur && Date.now() - (dm.last ?? 0) < idleMs()) {
       dm.last = Date.now();
       save();
-      // 任务导入桌面版后就是桌面会话：开着就注入进去，没开着不另起进程去续，免得一份对话分叉成两份
-      if (cur.desktop) {
-        await drain();
-        if (cur.socket && cur.token) {
-          cur.pending.push(text);
-          if (await deliver(cur, text)) {
-            save();
-            return react(m.message_id);
-          }
-          cur.pending.pop();
-        }
-        return say('这个任务已经在桌面版里打开过，目前没在运行。请在桌面打开它后再发一次，或发 /new 开新任务。');
-      }
-      runCli(dm.session, text, true); // 上一条还在跑就排队
-      return react(m.message_id);
+      return resumeWith(dm.session, text, m, say);
     }
     return startTask(m, text);
   }
