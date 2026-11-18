@@ -26,7 +26,10 @@ const EVENTS = path.join(HOME, 'events');
 const SETTINGS = path.join(os.homedir(), '.claude/settings.json');
 const LABEL = 'com.github.claude-code-feishu';
 const PLIST = path.join(os.homedir(), 'Library/LaunchAgents', LABEL + '.plist');
-const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'];
+const APPROVE_SOCK = path.join(HOME, 'approve.sock');
+const IMAGES = path.join(HOME, 'images');
+// 钩子事件 → [子命令, 超时秒]。PermissionRequest 要等手机回复，超时单独放长（转发程序自己 9 分钟就按拒绝回）
+const HOOKS = { SessionStart: ['hook', 5], UserPromptSubmit: ['hook', 5], Stop: ['hook', 5], SessionEnd: ['hook', 5], PermissionRequest: ['approve', 600] };
 // 只镜像桌面版和终端交互会话，外加本程序拉起的会话；脚本里的 claude -p、SDK 调用不进群
 const MIRRORED = ['claude-desktop', 'claude-desktop-3p', 'cli'];
 const PHONE_NOTE = '（这条是用户本人在手机飞书上发来的，由转发程序注入。请当作用户的直接输入处理，在对话里正常回复，不要用 SendMessage 回复。）\n\n';
@@ -41,7 +44,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const stdin = async () => { let s = ''; for await (const c of process.stdin) s += c; return s; };
 
-const commands = { setup, install, uninstall, run, hook, inject };
+const commands = { setup, install, uninstall, run, hook, inject, approve };
 const cmd = process.argv[2] ?? 'run';
 if (!commands[cmd]) throw new Error(`未知命令 ${cmd}，可用：${Object.keys(commands).join(' / ')}`);
 await commands[cmd]();
@@ -76,6 +79,26 @@ async function inject() {
   c.on('close', (hadError) => process.exit(hadError ? 1 : 0));
   c.on('error', () => process.exit(1));
   setTimeout(() => process.exit(1), 3000);
+}
+
+// ───────── 审批：会话要弹权限确认时调用一次（PermissionRequest 钩子）─────────
+// 本机所有会话都会走到这里。转发程序判断这一轮是不是手机发起的：是就把请求发到手机等回复；
+// 不是、或者转发程序没在跑，就什么都不输出，会话照常弹窗（命令行 -p 则照常拒绝）
+
+async function approve() {
+  let line;
+  try { line = JSON.stringify(JSON.parse(await stdin())) + '\n'; } catch { return; }
+  const answer = await new Promise((resolve) => {
+    let buf = '';
+    const c = net.connect(APPROVE_SOCK, () => c.write(line));
+    c.on('data', (d) => (buf += d));
+    c.on('close', () => resolve(buf));
+    c.on('error', () => resolve(''));
+  });
+  try {
+    const decision = JSON.parse(answer);
+    if (decision?.behavior) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }));
+  } catch {}
 }
 
 // ───────── setup：建应用、建话题群 ─────────
@@ -127,8 +150,8 @@ async function registerApp() {
 function install() {
   if (!fs.existsSync(CONFIG)) throw new Error('先运行 setup');
   const settings = stripHooks(readJSON(SETTINGS, {}));
-  const command = `"${process.execPath}" "${SELF}" hook`;
-  for (const e of HOOK_EVENTS) ((settings.hooks ??= {})[e] ??= []).push({ hooks: [{ type: 'command', command, timeout: 5 }] });
+  for (const [e, [sub, timeout]] of Object.entries(HOOKS))
+    ((settings.hooks ??= {})[e] ??= []).push({ hooks: [{ type: 'command', command: `"${process.execPath}" "${SELF}" ${sub}`, timeout }] });
   writeJSON(SETTINGS, settings);
   console.log(`钩子已写入 ${SETTINGS}`);
   if (process.platform !== 'darwin') return console.log(`请用 systemd、pm2 等常驻运行：node ${SELF}`);
@@ -159,7 +182,7 @@ function uninstall() {
 }
 
 function stripHooks(settings) {
-  for (const e of HOOK_EVENTS) {
+  for (const e of Object.keys(HOOKS)) {
     const list = settings.hooks?.[e]?.filter((g) => !g.hooks?.some((h) => h.command?.includes(SELF)));
     if (list?.length) settings.hooks[e] = list;
     else delete settings.hooks?.[e];
@@ -257,6 +280,8 @@ async function run() {
 
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
       const i = s.pending.findIndex((t) => ev.prompt.includes(t));
+      // phone 记下这一轮是谁发起的：手机发起的那一轮，权限确认才转到手机
+      s.phone = i >= 0;
       if (i >= 0) s.pending.splice(i, 1); // 手机发来的，不回显
       else if (s.dm) await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, null, s.dm);
       else await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, await topic(ev.session_id, titleOf(readTail(s.transcript)), ev.prompt.slice(0, 40)));
@@ -338,20 +363,135 @@ async function run() {
     });
   }
 
+  // ───── 手机审批 ─────
+  // 会话的 PermissionRequest 钩子经 approve.sock 问到这里。手机发起的那一轮，把请求发到私聊或话题，
+  // 等回复 y / n；同一个地方一次只问一个，回复只对应眼前这一个；超时按拒绝
+  const asking = new Map(); // 私聊 chat_id 或话题 root -> 上一个请求（排队用）
+  const waiting = new Map(); // 私聊 chat_id 或话题 root -> 收到回复时调用
+  const clip = (t, n = 3000) => (t.length > n ? t.slice(0, n) + `\n…（共 ${t.length} 字，只显示前 ${n} 字）` : t);
+  async function postAll(md, root, chat) { // 卡片有长度上限，长的分几条
+    for (let i = 0; i < md.length; i += 12000) await post(md.slice(i, i + 12000), root, chat);
+  }
+
+  function describe({ tool_name: tool, tool_input: input = {} }, mins) {
+    let body;
+    // 命令不截断：截掉尾巴可能正好藏着危险部分
+    if (tool === 'Bash') body = '```\n' + input.command + '\n```' + (input.description ? `\n${input.description}` : '');
+    else if (input.file_path) {
+      const content = input.content ?? input.new_string;
+      body = `\`${input.file_path}\`` + (content ? '\n```\n' + clip(content) + '\n```' : '');
+    } else body = '```\n' + clip(JSON.stringify(input, null, 2)) + '\n```';
+    return `🔐 **需要确认：${tool}**\n${body}\n\n回复 **y** 允许、**n** 拒绝；直接说别的也算拒绝，并把你的话转给 Claude。${mins} 分钟内不回按拒绝。`;
+  }
+
+  async function askPhone(key, root, chat, req) {
+    const mins = cfg.approve_timeout_minutes ?? 9; // 要比钩子的 600 秒短，超时由这里回拒绝，而不是钩子被杀
+    await postAll(describe(req, mins), root, chat);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        waiting.delete(key);
+        post(`⏱ ${mins} 分钟没有回复，已拒绝。`, root, chat).catch(() => {});
+        resolve({ behavior: 'deny', message: `用户在手机上 ${mins} 分钟内没有确认，已拒绝。` });
+      }, mins * 60e3);
+      waiting.set(key, (decision) => {
+        clearTimeout(timer);
+        waiting.delete(key);
+        resolve(decision);
+      });
+    });
+  }
+
+  // 返回 { behavior: 'allow' | 'deny', message? }；返回 null 表示不表态，会话照常弹窗
+  async function decide(req) {
+    await drain(); // 先把钩子事件读完，才知道这一轮是不是手机发起的
+    const s = state.sessions[req.session_id];
+    if (!s?.phone) return null;
+    // 手机发来的图片存在 images/ 里，读它不用再问
+    if (req.tool_name === 'Read' && String(req.tool_input?.file_path ?? '').startsWith(IMAGES + path.sep)) return { behavior: 'allow' };
+    const key = s.dm ?? s.root;
+    if (!key) return null;
+    const turn = (asking.get(key) ?? Promise.resolve()).then(() => askPhone(key, s.dm ? null : s.root, s.dm, req));
+    asking.set(key, turn.catch(() => {}));
+    return turn;
+  }
+
+  fs.rmSync(APPROVE_SOCK, { force: true });
+  net.createServer((c) => {
+    let buf = '', done = false;
+    c.on('data', async (d) => {
+      buf += d;
+      if (done || !buf.includes('\n')) return;
+      done = true;
+      let decision = null;
+      try { decision = await decide(JSON.parse(buf)); } catch (e) { log('approve failed', e.message); }
+      if (decision) log('approve', decision.behavior);
+      c.end(JSON.stringify(decision));
+    });
+    c.on('error', () => {}); // 钩子超时被杀时连接会断，不用管
+  }).listen(APPROVE_SOCK, () => fs.chmodSync(APPROVE_SOCK, 0o600));
+
+  // 手机回复正在等的审批：y 允许，n 拒绝，其他话也算拒绝并转给 Claude
+  function answerApproval(key, text, m) {
+    const done = waiting.get(key);
+    if (!done || !text) return false;
+    react(m.message_id);
+    if (/^(y|yes|ok|好|是|允许|可以|同意)$/i.test(text)) done({ behavior: 'allow' });
+    else if (/^(n|no|否|不|拒绝|不行|不要)$/i.test(text)) done({ behavior: 'deny', message: '用户在手机上拒绝了。' });
+    else done({ behavior: 'deny', message: `用户在手机上拒绝了，并说：${text}` });
+    return true;
+  }
+
+  // ───── 图片 ─────
+  // 手机发来的图片下载到 images/（留 7 天），在消息里附上路径让 Claude 用 Read 看
+  async function fetchImages(m, keys) {
+    fs.mkdirSync(IMAGES, { recursive: true, mode: 0o700 });
+    for (const f of fs.readdirSync(IMAGES)) {
+      const p = path.join(IMAGES, f);
+      if (Date.now() - fs.statSync(p).mtimeMs > 7 * 86400e3) fs.rmSync(p, { force: true });
+    }
+    const files = [];
+    for (const [i, key] of keys.entries()) {
+      const res = await client.im.v1.messageResource.get({ path: { message_id: m.message_id, file_key: key }, params: { type: 'image' } });
+      const base = path.join(IMAGES, `${m.message_id}-${i}`);
+      await res.writeFile(base);
+      // Read 按扩展名认图片，按文件头补上
+      const head = fs.readFileSync(base).subarray(0, 12);
+      const ext = head[0] === 0xff ? 'jpg' : head.toString('latin1', 1, 4) === 'PNG' ? 'png' : head.toString('latin1', 0, 3) === 'GIF' ? 'gif' : head.toString('latin1', 8, 12) === 'WEBP' ? 'webp' : 'png';
+      fs.renameSync(base, `${base}.${ext}`);
+      files.push(`${base}.${ext}`);
+    }
+    return files;
+  }
+
   async function onPhoneMessage({ message: m, sender }) {
     // 只认本人：别人私聊机器人也能在这台电脑上跑 Claude，所以私聊和群里一样先核对发送人
     if (sender?.sender_id?.open_id !== cfg.owner_open_id) return log('ignored: not owner', m.message_id);
     const dm = m.chat_type === 'p2p';
     if (!dm && m.chat_id !== cfg.chat_id) return log('ignored: other chat', m.chat_id);
-    let text = '';
+    let text = '', images = [];
     try {
       const c = JSON.parse(m.content);
-      text = m.message_type === 'text' ? c.text : (c.content ?? []).flat().map((x) => x.text ?? '').join('');
+      if (m.message_type === 'text') text = c.text;
+      else if (m.message_type === 'image') images = [c.image_key];
+      else { // post：富文本，段落里混着文字和图片
+        const els = (c.content ?? []).flat();
+        text = els.map((x) => x.text ?? '').join('');
+        images = els.filter((x) => x.tag === 'img' && x.image_key).map((x) => x.image_key);
+      }
     } catch {}
     text = text.replace(/@_user_\d+/g, '').trim();
+    const key = dm ? m.chat_id : m.root_id || m.message_id;
+    if (answerApproval(key, text, m)) return;
+    if (images.length) {
+      try {
+        const files = await fetchImages(m, images);
+        text = [text, ...files.map((f) => `[图片] ${f}`), '（手机发来的图片，已存到上面的路径，请用 Read 工具查看）'].filter(Boolean).join('\n');
+      } catch (e) {
+        return post(`图片下载失败：${e.message}`, dm ? null : key, dm ? m.chat_id : undefined);
+      }
+    }
     if (dm) return onDirectMessage(m, text);
-    const key = m.root_id || m.message_id;
-    if (!text) return post('暂时只支持文字消息。', key);
+    if (!text) return post('暂时只支持文字和图片。', key);
 
     const id = state.roots[key];
     if (!id) {
@@ -407,7 +547,7 @@ async function run() {
     const dm = (state.dm ??= {});
     dm.chat_id = m.chat_id;
     const say = (md) => post(md, null, m.chat_id);
-    if (!text) return say('暂时只支持文字消息。');
+    if (!text) return say('暂时只支持文字和图片。');
     const [, cmd, arg = ''] = text.match(/^\/(new|cd|help)(?:\s+([\s\S]*))?$/i) ?? [];
     switch (cmd?.toLowerCase()) {
       case 'help': // 「/help 你是谁」：先回说明，后面的内容照常当一条消息处理
