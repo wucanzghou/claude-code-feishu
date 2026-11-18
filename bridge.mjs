@@ -216,23 +216,31 @@ async function run() {
   const save = () => writeJSON(STATE, state);
   const session = (id) => (state.sessions[id] ??= { posted: [], pending: [] });
 
-  const card = (md) => JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: md }] } });
+  const cardOf = (elements) => JSON.stringify({ schema: '2.0', body: { elements } });
+  const card = (md) => cardOf([{ tag: 'markdown', content: md }]);
   // 有 root 就回进群里那个话题；否则发到 chat（默认话题群，私聊会话传私聊的 chat_id）
-  async function post(md, root, chat = cfg.chat_id) {
+  async function postCard(elements, root, chat = cfg.chat_id) {
+    const content = cardOf(elements);
     const res = root
-      ? await client.im.v1.message.reply({ path: { message_id: root }, data: { msg_type: 'interactive', content: card(md), reply_in_thread: true } })
-      : await client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chat, msg_type: 'interactive', content: card(md) } });
+      ? await client.im.v1.message.reply({ path: { message_id: root }, data: { msg_type: 'interactive', content, reply_in_thread: true } })
+      : await client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chat, msg_type: 'interactive', content } });
     if (res.code !== 0) throw new Error(`feishu ${res.code} ${res.msg}`);
     return res.data.message_id;
   }
+  const post = (md, root, chat) => postCard([{ tag: 'markdown', content: md }], root, chat);
+  const patch = (id, md) => client.im.v1.message.patch({ path: { message_id: id }, data: { content: card(md) } }).catch(() => {});
   const react = (id) => client.im.v1.messageReaction.create({ path: { message_id: id }, data: { reaction_type: { emoji_type: 'OnIt' } } }).catch(() => {});
+  // 按钮点了走 card.action.trigger 回调，value 原样带回来
+  const button = (text, value, type = 'default') => ({ tag: 'button', text: { tag: 'plain_text', content: text }, type, behaviors: [{ type: 'callback', value }] });
+  const buttonRow = (buttons) => ({ tag: 'column_set', flex_mode: 'flow', horizontal_spacing: '8px', columns: buttons.map((b) => ({ tag: 'column', width: 'auto', elements: [b] })) });
+  const plain = (content) => ({ tag: 'plain_text', content });
 
-  // 读对话文件末尾 4MB
-  function readTail(file) {
+  // 读对话文件末尾（默认 4MB）
+  function readTail(file, max = 4 << 20) {
     try {
       const fd = fs.openSync(file, 'r');
       const size = fs.fstatSync(fd).size;
-      const buf = Buffer.alloc(Math.min(size, 4 << 20));
+      const buf = Buffer.alloc(Math.min(size, max));
       fs.readSync(fd, buf, 0, buf.length, size - buf.length);
       fs.closeSync(fd);
       return buf.toString('utf8').split('\n').slice(size > buf.length ? 1 : 0).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
@@ -240,16 +248,19 @@ async function run() {
   }
   // 会话标题：桌面版和终端都会往对话文件里写 custom-title / ai-title
   const titleOf = (records) => records.findLast((r) => r.customTitle)?.customTitle ?? records.findLast((r) => r.aiTitle)?.aiTitle;
+  // 用户输入（一轮的开头）：真人打的字或排队进来的消息，不算工具结果
+  function isPrompt(r) {
+    const c = r.message?.content;
+    return (r.type === 'user' && !r.isMeta && (typeof c === 'string' || (Array.isArray(c) && c.some((b) => b.type === 'text') && !c.some((b) => b.type === 'tool_result')))) ||
+      (r.type === 'attachment' && r.attachment?.type === 'queued_command');
+  }
   // 本轮（最后一个用户输入之后）还没发过的助手文字
   function turnTexts(records, posted) {
     let out = [];
     for (const r of records) {
       if (r.isSidechain) continue;
       const c = r.message?.content;
-      const isPrompt =
-        (r.type === 'user' && !r.isMeta && (typeof c === 'string' || (Array.isArray(c) && c.some((b) => b.type === 'text') && !c.some((b) => b.type === 'tool_result')))) ||
-        (r.type === 'attachment' && r.attachment?.type === 'queued_command');
-      if (isPrompt) out = [];
+      if (isPrompt(r)) out = [];
       else if (r.type === 'assistant' && Array.isArray(c) && !posted.includes(r.uuid)) {
         const text = c.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
         if (text) out.push({ uuid: r.uuid, text });
@@ -279,18 +290,24 @@ async function run() {
     if (ev.transcript) s.transcript = ev.transcript;
     if (ev.desktop) s.desktop = true;
     if (ev.socket && ev.token) Object.assign(s, { socket: ev.socket, token: ev.token });
-    if (ev.event === 'SessionEnd') Object.assign(s, { socket: undefined, token: undefined });
+    if (ev.event === 'SessionEnd') {
+      Object.assign(s, { socket: undefined, token: undefined });
+      finishStatus(ev.session_id, '⏹ 会话已结束');
+    }
 
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
       const i = s.pending.findIndex((t) => ev.prompt.includes(t));
       // phone 记下这一轮是谁发起的：手机发起的那一轮，权限确认才转到手机
       s.phone = i >= 0;
+      await finishStatus(ev.session_id, '⏹ 已结束'); // 上一轮被中断时收不到 Stop
+      if (s.phone) startStatus(ev.session_id);
       if (i >= 0) s.pending.splice(i, 1); // 手机发来的，不回显
       else if (s.dm) await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, null, s.dm);
       else await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, await topic(ev.session_id, titleOf(readTail(s.transcript)), ev.prompt.slice(0, 40)));
     }
     if (ev.event === 'Stop' && s.transcript) {
       await sleep(800); // 等对话文件写完
+      await finishStatus(ev.session_id, '✅ 完成');
       const records = readTail(s.transcript);
       const texts = turnTexts(records, s.posted);
       // 私聊里开的会话回私聊，其余回群里各自的话题
@@ -345,6 +362,8 @@ async function run() {
     if (process.env.CLAUDECODE) for (const k of Object.keys(env)) if (/^(CLAUDE|MCP_|ANTHROPIC_BASE_URL$)/.test(k)) delete env[k];
     return env;
   }
+  // 用桌面版同款的 stream-json 模式跑：权限确认和 AskUserQuestion 选择题经 stdio 问到这里（answerTool），
+  // 纯文本 -p 模式下没有 AskUserQuestion。一个进程只跑一条消息，跑完关掉输入让它退出
   function runCli(id, text, resume) {
     if (running.has(id)) return running.get(id).push(text);
     running.set(id, []);
@@ -352,19 +371,45 @@ async function run() {
     s.pending.push(text);
     if (!resume && cfg.desktop_import !== false) s.to_desktop = true;
     const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
-    const args = ['-p', text, '--permission-mode', mode, resume ? '--resume' : '--session-id', id];
-    const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['ignore', 'ignore', 'pipe'] });
+    const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+      '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id];
+    const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', s.cwd);
-    let err = '';
+    const send = (o) => child.stdin.writable && child.stdin.write(JSON.stringify(o) + '\n');
+    child.stdin.on('error', () => {});
+    send({ type: 'user', message: { role: 'user', content: text } });
+    let err = '', out = '', failed = false;
     child.stderr.on('data', (d) => (err = (err + d).slice(-1500)));
     child.on('error', (e) => (err += e.message));
+    child.stdout.on('data', (d) => {
+      out += d;
+      for (let i; (i = out.indexOf('\n')) >= 0;) {
+        const line = out.slice(0, i);
+        out = out.slice(i + 1);
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.type === 'control_request') {
+          const reply = (response) => send({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
+          const fail = (e) => send({ type: 'control_response', response: { subtype: 'error', request_id: msg.request_id, error: e.message } });
+          if (msg.request?.subtype === 'can_use_tool') answerTool(s, msg.request).then(reply, fail);
+          else fail(new Error(`unsupported control request ${msg.request?.subtype}`));
+        } else if (msg.type === 'result') {
+          if (msg.is_error) {
+            failed = true;
+            err = String(msg.result ?? msg.subtype ?? 'error').slice(-1500) + (err ? `\n\n${err}` : '');
+          }
+          child.stdin.end();
+        }
+      }
+    });
     child.on('close', (code) => { // 进程没能起来（error）时也会触发 close
       log('cli exit', id.slice(0, 8), code);
-      if (code) post(`⚠️ 命令行会话退出（${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
+      finishStatus(id, code || failed ? '⚠️ 出错了' : '✅ 完成');
+      if (code || failed) post(`⚠️ 命令行会话出错（退出码 ${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
       const queued = running.get(id);
       running.delete(id);
       if (queued.length) return runCli(id, queued.join('\n\n'), true);
-      if (!code && s.to_desktop) importToDesktop(id).catch((e) => log('desktop import failed', id.slice(0, 8), e.message));
+      if (!code && !failed && s.to_desktop) importToDesktop(id).catch((e) => log('desktop import failed', id.slice(0, 8), e.message));
     });
   }
 
@@ -410,17 +455,68 @@ async function run() {
     react(m.message_id);
   }
 
-  // ───── 手机审批 ─────
-  // 会话的 PermissionRequest 钩子经 approve.sock 问到这里。手机发起的那一轮，把请求发到私聊或话题，
-  // 等回复 y / n；同一个地方一次只问一个，回复只对应眼前这一个；超时按拒绝
-  const asking = new Map(); // 私聊 chat_id 或话题 root -> 上一个请求（排队用）
-  const waiting = new Map(); // 私聊 chat_id 或话题 root -> 收到回复时调用
+  // ───── 手机审批和选择题 ─────
+  // 手机发起的那一轮要确认权限、或者 Claude 用 AskUserQuestion 提问时，发一张带按钮的卡片到私聊或话题，
+  // 等手机上点按钮（card.action.trigger 回调）或回文字。同一个地方一次只问一个，回复只对应眼前这一个；超时按拒绝。
+  // 转发程序自己起的会话经 stdio 问到 answerTool；桌面版、终端会话经 PermissionRequest 钩子问到 decide
+  const asking = new Map(); // 私聊 chat_id 或话题 root -> 队尾（排队用）
+  const waiting = new Map(); // 私聊 chat_id 或话题 root -> 眼前这个请求 { text(回复) }
+  const prompts = new Map(); // 请求 id -> 同一个请求 { click(按钮值, 表单值) }，按钮回调按 id 找
   const clip = (t, n = 3000) => (t.length > n ? t.slice(0, n) + `\n…（共 ${t.length} 字，只显示前 ${n} 字）` : t);
-  async function postAll(md, root, chat) { // 卡片有长度上限，长的分几条
-    for (let i = 0; i < md.length; i += 12000) await post(md.slice(i, i + 12000), root, chat);
+  const chunks = (md) => (md.length <= 12000 ? [md] : Array.from({ length: Math.ceil(md.length / 12000) }, (_, i) => md.slice(i * 12000, (i + 1) * 12000)));
+  function enqueue(key, fn) {
+    const turn = (asking.get(key) ?? Promise.resolve()).then(fn);
+    asking.set(key, turn.catch(() => {}));
+    return turn;
   }
 
-  function describe({ tool_name: tool, tool_input: input = {} }, mins) {
+  // spec: body 正文；hint(分钟) 怎么回；controls(id) 按钮或表单；fromText / fromClick 把回复变成结果，
+  // 看不懂时返回一句提示（字符串）；summary(结果) 答完后卡片上显示什么；timeout(分钟) 超时的结果
+  async function ask(key, root, chat, spec) {
+    const id = crypto.randomUUID().slice(0, 8);
+    const mins = cfg.approve_timeout_minutes ?? 9; // 钩子最多等 600 秒，超时由这里回拒绝，而不是钩子被杀
+    const parts = chunks(`${spec.body}\n\n${spec.hint(mins)}`); // 卡片有长度上限，长的分几条，按钮放最后一条
+    for (const p of parts.slice(0, -1)) await post(p, root, chat);
+    let msg;
+    try {
+      msg = await postCard([{ tag: 'markdown', content: parts.at(-1) }, ...spec.controls(id)], root, chat);
+    } catch (e) { // 卡片结构被拒时退回纯文字，回文字照样能答
+      log('button card failed', e.message);
+      msg = await post(parts.at(-1), root, chat);
+    }
+    const final = (result) => `${parts.length === 1 ? spec.body : '（内容见上面几条）'}\n\n${spec.summary(result)}`;
+    return new Promise((resolve) => {
+      const finish = (result) => {
+        clearTimeout(timer);
+        waiting.delete(key);
+        prompts.delete(id);
+        resolve(result);
+        nudgeStatus(key);
+        return final(result);
+      };
+      const timer = setTimeout(() => {
+        patch(msg, finish(spec.timeout(mins)));
+        post(`⏱ ${mins} 分钟没有回复，已按拒绝处理。`, root, chat).catch(() => {});
+      }, mins * 60e3);
+      const entry = {
+        text(t) {
+          const r = spec.fromText(t);
+          if (typeof r === 'string') return r;
+          patch(msg, finish(r));
+        },
+        click(value, form) {
+          const r = spec.fromClick(value, form);
+          if (typeof r === 'string') return { toast: { type: 'warning', content: r } };
+          return { toast: { type: 'success', content: '已提交' }, card: { type: 'raw', data: JSON.parse(card(finish(r))) } };
+        },
+      };
+      waiting.set(key, entry);
+      prompts.set(id, entry);
+      nudgeStatus(key);
+    });
+  }
+
+  function describe({ tool_name: tool, tool_input: input = {} }) {
     let body;
     // 命令不截断：截掉尾巴可能正好藏着危险部分
     if (tool === 'Bash') body = '```\n' + input.command + '\n```' + (input.description ? `\n${input.description}` : '');
@@ -428,38 +524,105 @@ async function run() {
       const content = input.content ?? input.new_string;
       body = `\`${input.file_path}\`` + (content ? '\n```\n' + clip(content) + '\n```' : '');
     } else body = '```\n' + clip(JSON.stringify(input, null, 2)) + '\n```';
-    return `🔐 **需要确认：${tool}**\n${body}\n\n回复 **y** 允许、**n** 拒绝；直接说别的也算拒绝，并把你的话转给 Claude。${mins} 分钟内不回按拒绝。`;
+    return `🔐 **需要确认：${tool}**\n${body}`;
+  }
+  const refused = (said) => ({ behavior: 'deny', message: said ? `用户在手机上拒绝了，并说：${said}` : '用户在手机上拒绝了。' });
+  const approvalSpec = (req) => ({
+    body: describe(req),
+    hint: (mins) => `点按钮，或回复 **y** 允许、**n** 拒绝；直接说别的也算拒绝，并把你的话转给 Claude。${mins} 分钟内不回按拒绝。`,
+    controls: (id) => [buttonRow([button('允许', { a: 'allow', id }, 'primary_filled'), button('拒绝', { a: 'deny', id }, 'danger')])],
+    fromText: (t) => (/^(y|yes|ok|好|是|允许|可以|同意)$/i.test(t) ? { behavior: 'allow' } : refused(/^(n|no|否|不|拒绝|不行|不要)$/i.test(t) ? '' : t)),
+    fromClick: (v) => (v.a === 'allow' ? { behavior: 'allow' } : refused('')),
+    summary: (r) => (r.behavior === 'allow' ? '✅ 已允许' : `❌ ${r.message.replace(/^用户在手机上/, '')}`),
+    timeout: (mins) => ({ behavior: 'deny', message: `用户在手机上 ${mins} 分钟内没有确认，已拒绝。` }),
+  });
+
+  // AskUserQuestion：单题单选直接点选项；多选或多题用表单（下拉 + 自己写），点提交。
+  // 也能回文字：编号（多选用逗号隔开，多题按顺序用 / 隔开）或直接打字
+  function textAnswers(qs, text) {
+    const parts = qs.length === 1 ? [text] : text.split(/\s*[\n/／]\s*/).filter(Boolean);
+    if (parts.length !== qs.length) return null;
+    return Object.fromEntries(qs.map((q, i) => {
+      const nums = parts[i].split(/[\s,，、]+/).filter(Boolean);
+      const ok = nums.every((n) => /^\d+$/.test(n) && +n >= 1 && +n <= q.options.length) && (q.multiSelect || nums.length === 1);
+      return [q.question, ok ? nums.map((n) => q.options[n - 1].label).join(', ') : parts[i]];
+    }));
+  }
+  function questionSpec(input) {
+    const qs = input.questions ?? [];
+    const simple = qs.length === 1 && !qs[0].multiSelect;
+    const answered = (answers) => ({ behavior: 'allow', updatedInput: { ...input, answers } });
+    const options = (q) => q.options.map((o, j) => ({ text: plain(o.label), value: String(j) }));
+    return {
+      body: '❓ **Claude 在问你**\n\n' + qs.map((q, i) =>
+        `**${qs.length > 1 ? `${i + 1}. ` : ''}${q.question}**${q.multiSelect ? '（可多选）' : ''}\n` +
+        q.options.map((o, j) => `${j + 1}. ${o.label}${o.description && o.description !== o.label ? ` — ${o.description}` : ''}`).join('\n')).join('\n\n'),
+      hint: (mins) => (simple ? '点选项，或回复编号；也可以直接打字回答。'
+        : qs.length === 1 ? '选好后点提交；也可以回复编号（多个用逗号隔开），或直接打字。'
+          : '选好后点提交；也可以按题目顺序回复编号、用 / 隔开（如 2 / 1,3），或直接打字。') + `${mins} 分钟内不回就当没回答。`,
+      controls: (id) => (simple
+        ? [buttonRow(qs[0].options.map((o, j) => button(o.label, { a: 'pick', id, o: j })))]
+        : [{
+          tag: 'form', name: `ask_${id}`, elements: [
+            ...qs.flatMap((q, i) => [
+              { tag: 'markdown', content: `**${qs.length > 1 ? `${i + 1}. ` : ''}${q.question}**` },
+              { tag: q.multiSelect ? 'multi_select_static' : 'select_static', name: `q${i}`, placeholder: plain(q.multiSelect ? '选一个或多个' : '选一个'), options: options(q) },
+              { tag: 'input', name: `o${i}`, placeholder: plain('不在选项里？写在这') },
+            ]),
+            { tag: 'button', name: 'submit', text: plain('提交'), type: 'primary_filled', form_action_type: 'submit', behaviors: [{ type: 'callback', value: { a: 'form', id } }] },
+          ],
+        }]),
+      fromText: (t) => {
+        const a = textAnswers(qs, t);
+        return a ? answered(a) : `有 ${qs.length} 道题，按顺序用 / 隔开回复，比如 2 / 1,3`;
+      },
+      fromClick: (v, form) => {
+        if (v.a === 'pick') return answered({ [qs[0].question]: qs[0].options[v.o]?.label ?? '' });
+        const answers = {};
+        for (const [i, q] of qs.entries()) {
+          const picked = [].concat(form[`q${i}`] ?? []).map((j) => q.options[+j]?.label).filter(Boolean);
+          const own = String(form[`o${i}`] ?? '').trim();
+          if (!picked.length && !own) return `第 ${i + 1} 题还没选`;
+          answers[q.question] = [...picked, ...(own ? [own] : [])].join(', ');
+        }
+        return answered(answers);
+      },
+      summary: (r) => (r.behavior === 'allow'
+        ? '✅ 已回答\n' + Object.entries(r.updatedInput.answers).map(([q, a]) => `- ${q} → **${a}**`).join('\n')
+        : `⏱ ${r.message.replace(/^用户在手机上/, '')}`),
+      timeout: (mins) => ({ behavior: 'deny', message: `用户在手机上 ${mins} 分钟内没有回答。` }),
+    };
   }
 
-  async function askPhone(key, root, chat, req) {
-    const mins = cfg.approve_timeout_minutes ?? 9; // 要比钩子的 600 秒短，超时由这里回拒绝，而不是钩子被杀
-    await postAll(describe(req, mins), root, chat);
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        waiting.delete(key);
-        post(`⏱ ${mins} 分钟没有回复，已拒绝。`, root, chat).catch(() => {});
-        resolve({ behavior: 'deny', message: `用户在手机上 ${mins} 分钟内没有确认，已拒绝。` });
-      }, mins * 60e3);
-      waiting.set(key, (decision) => {
-        clearTimeout(timer);
-        waiting.delete(key);
-        resolve(decision);
-      });
-    });
+  // 手机发来的图片存在 images/ 里，读它不用再问
+  const isImageRead = (tool, input) => tool === 'Read' && String(input?.file_path ?? '').startsWith(IMAGES + path.sep);
+
+  // 转发程序自己起的会话（stdio）：返回 { behavior: 'allow', updatedInput } 或 { behavior: 'deny', message }
+  async function answerTool(s, req) {
+    const key = s.dm ?? s.root;
+    const root = s.dm ? null : s.root;
+    const input = req.input ?? {};
+    if (!key) return { behavior: 'deny', message: '转发程序找不到这个会话对应的飞书会话，没法确认。' };
+    if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, questionSpec(input)));
+    if (isImageRead(req.tool_name, input)) return { behavior: 'allow', updatedInput: input };
+    const d = await enqueue(key, () => ask(key, root, s.dm, approvalSpec({ tool_name: req.tool_name, tool_input: input })));
+    return d.behavior === 'allow' ? { behavior: 'allow', updatedInput: input } : d;
   }
 
-  // 返回 { behavior: 'allow' | 'deny', message? }；返回 null 表示不表态，会话照常弹窗
+  // 桌面版、终端会话（PermissionRequest 钩子）：返回 { behavior, message? }；返回 null 表示不表态，会话照常弹窗
   async function decide(req) {
     await drain(); // 先把钩子事件读完，才知道这一轮是不是手机发起的
     const s = state.sessions[req.session_id];
     if (!s?.phone) return null;
-    // 手机发来的图片存在 images/ 里，读它不用再问
-    if (req.tool_name === 'Read' && String(req.tool_input?.file_path ?? '').startsWith(IMAGES + path.sep)) return { behavior: 'allow' };
+    if (running.has(req.session_id)) return null; // 转发程序自己起的：不在这里答，CLI 会接着经 stdio 问到 answerTool
     const key = s.dm ?? s.root;
     if (!key) return null;
-    const turn = (asking.get(key) ?? Promise.resolve()).then(() => askPhone(key, s.dm ? null : s.root, s.dm, req));
-    asking.set(key, turn.catch(() => {}));
-    return turn;
+    if (req.tool_name === 'AskUserQuestion') { // 钩子答不了选择题，只能在桌面上点
+      post(`${questionSpec(req.tool_input ?? {}).body}\n\n这道题要在桌面版里选，手机上答不了。`, s.dm ? null : s.root, s.dm).catch(() => {});
+      return null;
+    }
+    if (isImageRead(req.tool_name, req.tool_input)) return { behavior: 'allow' };
+    return enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, approvalSpec(req)));
   }
 
   fs.rmSync(APPROVE_SOCK, { force: true });
@@ -477,16 +640,69 @@ async function run() {
     c.on('error', () => {}); // 钩子超时被杀时连接会断，不用管
   }).listen(APPROVE_SOCK, () => fs.chmodSync(APPROVE_SOCK, 0o600));
 
-  // 手机回复正在等的审批：y 允许，n 拒绝，其他话也算拒绝并转给 Claude
-  function answerApproval(key, text, m) {
-    const done = waiting.get(key);
-    if (!done || !text) return false;
-    react(m.message_id);
-    if (/^(y|yes|ok|好|是|允许|可以|同意)$/i.test(text)) done({ behavior: 'allow' });
-    else if (/^(n|no|否|不|拒绝|不行|不要)$/i.test(text)) done({ behavior: 'deny', message: '用户在手机上拒绝了。' });
-    else done({ behavior: 'deny', message: `用户在手机上拒绝了，并说：${text}` });
+  // 手机回文字答眼前这个请求；看不懂就回一句提示，请求继续等
+  function answerPending(key, text, m) {
+    const p = waiting.get(key);
+    if (!p || !text) return false;
+    const hint = p.text(text);
+    if (hint) post(hint, m.chat_type === 'p2p' ? null : key, m.chat_type === 'p2p' ? m.chat_id : undefined).catch(() => {});
+    else react(m.message_id);
     return true;
   }
+
+  // ───── 工作中 ─────
+  // 手机发起的一轮开始时（UserPromptSubmit）发一张状态卡片，每 15 秒按对话文件刷新：用时、调用了几次工具、
+  // 最近在做什么、是不是在等你确认；这一轮结束（Stop、进程退出、会话结束）时改成完成
+  const status = new Map(); // sessionId -> { key, start, msg, timer, shown }
+  const duration = (ms) => (ms < 60e3 ? `${Math.round(ms / 1e3)} 秒` : `${Math.floor(ms / 60e3)} 分 ${Math.round((ms % 60e3) / 1e3)} 秒`);
+  function toolLine(b) {
+    const i = b.input ?? {};
+    const arg = i.description ?? i.command ?? i.file_path ?? i.pattern ?? i.url ?? i.query ?? i.prompt ?? i.sql ?? '';
+    return `${b.name}${arg ? ` · ${String(arg).replace(/\s+/g, ' ').slice(0, 80)}` : ''}`;
+  }
+  function statusMd(id, st, done) {
+    const records = readTail(session(id).transcript, 1 << 20).filter((r) => !r.isSidechain);
+    const start = records.findLastIndex(isPrompt);
+    const tools = records.slice(start + 1).flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use') : []));
+    const count = tools.length ? ` · 调用工具 ${tools.length} 次` : '';
+    if (done) return `${done} · 用时 ${duration(Date.now() - st.start)}${count}`;
+    const lines = [`⏳ **工作中** · ${duration(Date.now() - st.start)}${count}`];
+    if (waiting.has(st.key)) lines.push('⏸ 在等你回复（看下面那条）');
+    else if (tools.length) lines.push(`最近：${toolLine(tools.at(-1))}`);
+    else lines.push('正在想…');
+    return lines.join('\n');
+  }
+  function startStatus(id) {
+    const s = session(id);
+    const key = s.dm ?? s.root;
+    if (!key || status.has(id)) return;
+    const st = { key, start: Date.now() };
+    status.set(id, st);
+    st.msg = post(statusMd(id, st), s.dm ? null : s.root, s.dm).catch(() => null);
+    st.timer = setInterval(() => refreshStatus(id), 15e3);
+  }
+  async function refreshStatus(id) {
+    const st = status.get(id);
+    if (!st) return;
+    const s = session(id);
+    // 进程已经没了却没收到结束信号（被打断、崩溃）
+    if (!running.has(id) && !(s.socket && alive(s.socket))) return finishStatus(id, '⏹ 已停止');
+    if (Date.now() - st.start > 6 * 3600e3) return finishStatus(id, '⏹ 超过 6 小时，不再刷新');
+    const md = statusMd(id, st);
+    if (md === st.shown) return;
+    st.shown = md;
+    const msg = await st.msg;
+    if (msg && status.get(id) === st) await patch(msg, md);
+  }
+  async function finishStatus(id, done) {
+    const st = status.get(id);
+    if (!st) return;
+    status.delete(id);
+    clearInterval(st.timer);
+    const msg = await st.msg;
+    if (msg) await patch(msg, statusMd(id, st, done));
+  }
+  const nudgeStatus = (key) => { for (const [id, st] of status) if (st.key === key) refreshStatus(id); };
 
   // ───── 图片 ─────
   // 手机发来的图片下载到 images/（留 7 天），在消息里附上路径让 Claude 用 Read 看
@@ -528,7 +744,7 @@ async function run() {
     } catch {}
     text = text.replace(/@_user_\d+/g, '').trim();
     const key = dm ? m.chat_id : m.root_id || m.message_id;
-    if (answerApproval(key, text, m)) return;
+    if (answerPending(key, text, m)) return;
     if (images.length) {
       try {
         const files = await fetchImages(m, images);
@@ -626,6 +842,16 @@ async function run() {
       if (seen.has(m.message_id)) return; // 飞书偶尔重复推送
       seen.add(m.message_id);
       onPhoneMessage(data).catch((e) => log('phone message failed', e.message));
+    },
+    // 卡片按钮（审批、选择题）。要在飞书开发者后台「事件与回调 → 回调配置」用长连接订阅 card.action.trigger。
+    // 返回值就是给飞书的回调响应：弹个提示，答完的卡片换成去掉按钮的样子
+    'card.action.trigger': (data) => {
+      const v = data.action?.value ?? {};
+      log('card action', v.a ?? '', v.id ?? '');
+      if (data.operator?.open_id !== cfg.owner_open_id) return { toast: { type: 'error', content: '只有本人能操作' } };
+      const p = prompts.get(v.id);
+      if (!p) return { toast: { type: 'info', content: '这个请求已经结束了' } };
+      return p.click(v, data.action?.form_value ?? {});
     },
     // 一键建的应用还订阅了表情事件，登记空处理，免得日志刷警告
     'im.message.reaction.created_v1': () => {},
