@@ -103,6 +103,15 @@ Claude 用 AskUserQuestion 提问时（单选、多选、一次几道题），�
 
 手机发起的每一轮开始时会发一张状态卡片，每 15 秒刷新：用了多久、调用了几次工具、最近在做什么（比如 `Bash · 查日志`），在等你确认时会标出来；这一轮做完改成「✅ 完成 · 用时 3 分 12 秒 · 调用工具 14 次」，后面跟着回复。被打断或进程没了会改成「⏹ 已停止」。
 
+手机开的会话，卡片上有 **停止** 按钮，也可以发 `/stop`（私聊停当前任务，话题里停那个话题的会话）：正在等的审批、选择题按没执行放掉，已经排着的消息清掉，再中断进程；停下之后再发的消息照常接着跑。桌面版、终端会话从外面停不了，卡片上不放按钮，要在电脑上停。
+
+## 文件回传
+
+Claude 在回复里单独写一行 `[发送文件] /绝对路径`（转发程序会在提示里告诉它这个写法），这一行不显示，文件直接发到私聊或话题：图片（10MB 内）直接显示，其他文件（30MB 内）按附件发。手机上也可以直接发 `/file 路径`，相对路径按当前任务的目录算。
+
+- 密钥和凭据一律不发：`~/.ssh`、`~/.aws`、`~/.gnupg`、钥匙串、转发程序自己的配置目录等，以及 `.env`、`*.pem`、`*.key`、`id_rsa`、`appsettings*.json`、`web.config`、名字里带 credential / secret / password / token 的文件。软链接按真实路径检查。
+- 文件会上传到飞书，只发到你自己的私聊或话题群里。用的是应用已有的「获取与上传图片或文件资源」权限，不用另开。
+
 ## 私聊：不进群，直接和机器人聊
 
 在飞书里点开机器人发私信，不用开话题。适合查个数、问个问题这种做完就扔的临时任务。
@@ -110,7 +119,7 @@ Claude 用 AskUserQuestion 提问时（单选、多选、一次几道题），�
 - **一条消息就是一个任务**，第一轮用命令行会话（`claude -p`）去做，回复直接回到私聊；做完自动导入桌面版（见上面），之后在桌面或私聊里都能接着聊。
 - **连着发会接着聊**；空闲超过 `dm_idle_minutes`（默认 30 分钟）再发，自动开新任务。上一条还没跑完时发的消息先排队，跑完合成一条接着续。
 - **私聊任务在 `dm_workdir` 里做**（不配就是 `workdir`）。建议直接配成项目根目录：项目 `.claude/` 里的放行规则只在工作目录那一层生效，放到项目的子目录里就够不着了。
-- 指令：`/new [内容]` 开新任务，`/cd <别名或绝对路径> [内容]` 在指定目录开新任务（别名配在 `projects`），`/help`。
+- 指令：`/new [内容]` 开新任务，`/cd <别名或绝对路径> [内容]` 在指定目录开新任务（别名配在 `projects`），`/stop` 停止，`/file <路径>` 发文件，`/help`。
 - 和群里一样只认 `owner_open_id`，别人私聊机器人一律忽略。
 
 ## 安全边界
@@ -180,7 +189,7 @@ Field notes:
 - If a desktop session's process has exited there is no socket; the bot asks you to reopen it rather than forking the conversation. Terminal and phone-started sessions resume with `claude -p --resume`.
 - This relies on an undocumented internal protocol (tested on Claude Code 2.1.3xx). If it changes, the bot reports the session as not running.
 
-Direct messages to the bot work too: each DM starts a throwaway `claude -p` task in `dm_workdir`, consecutive messages continue it, and `/new`, `/cd`, `/help` manage it. Only the owner's messages are accepted, in the group or in DMs. After its first turn, every phone-started session is imported into Claude Desktop (a `custom-title` line is appended to the transcript, then `claude://resume?session=<id>` is opened), so it shows up in the sidebar and can be continued there; set `"desktop_import": false` to turn this off. Messages to a session whose process has exited resume it with `claude -p --resume`, desktop sessions included. Images (single or inside rich text) are downloaded and passed to Claude as file paths. Phone-started sessions run in stream-json mode with `--permission-prompt-tool stdio`, so permission prompts and AskUserQuestion questions come back to the bridge and are sent as cards with buttons (single choice) or a form (multi-select / several questions); text replies work too. Buttons need the `card.action.trigger` callback subscribed over the long connection in the Feishu developer console. Each phone-started turn also gets a status card that refreshes every 15 seconds (elapsed time, tool calls, latest tool) and turns into a done line when the turn ends. In desktop and terminal sessions, permission prompts of phone-started turns are forwarded by a `PermissionRequest` hook (the hook cannot answer AskUserQuestion, so those questions are only shown). Tap Allow / Deny or reply `y` / `n` (anything else denies and is passed to Claude); the bridge waits for your answer indefinitely unless `approve_timeout_minutes` is set. In desktop sessions the desktop prompt is shown at the same time and whichever side answers first wins; the phone card is closed when the desktop answers. Phone-started sessions default to `bypassPermissions`; change `permission_mode` in `~/.claude/feishu-bridge/config.json` to tighten it.
+Direct messages to the bot work too: each DM starts a throwaway `claude -p` task in `dm_workdir`, consecutive messages continue it, and `/new`, `/cd`, `/help` manage it. Only the owner's messages are accepted, in the group or in DMs. After its first turn, every phone-started session is imported into Claude Desktop (a `custom-title` line is appended to the transcript, then `claude://resume?session=<id>` is opened), so it shows up in the sidebar and can be continued there; set `"desktop_import": false` to turn this off. Messages to a session whose process has exited resume it with `claude -p --resume`, desktop sessions included. Images (single or inside rich text) are downloaded and passed to Claude as file paths. Phone-started sessions run in stream-json mode with `--permission-prompt-tool stdio`, so permission prompts and AskUserQuestion questions come back to the bridge and are sent as cards with buttons (single choice) or a form (multi-select / several questions); text replies work too. Buttons need the `card.action.trigger` callback subscribed over the long connection in the Feishu developer console. Each phone-started turn also gets a status card that refreshes every 15 seconds (elapsed time, tool calls, latest tool) and turns into a done line when the turn ends; for phone-started sessions it carries a Stop button (also `/stop`), which cancels pending prompts, drops queued messages and interrupts the process. Claude can send files to the chat by writing a line `[发送文件] /absolute/path` in its reply, and `/file <path>` does the same from the phone; images are shown inline, other files are attached, and key or credential files (`~/.ssh`, `.env`, `*.pem`, the bridge's own config, and so on) are never sent. In desktop and terminal sessions, permission prompts of phone-started turns are forwarded by a `PermissionRequest` hook (the hook cannot answer AskUserQuestion, so those questions are only shown). Tap Allow / Deny or reply `y` / `n` (anything else denies and is passed to Claude); the bridge waits for your answer indefinitely unless `approve_timeout_minutes` is set. In desktop sessions the desktop prompt is shown at the same time and whichever side answers first wins; the phone card is closed when the desktop answers. Phone-started sessions default to `bypassPermissions`; change `permission_mode` in `~/.claude/feishu-bridge/config.json` to tighten it.
 
 ## License
 

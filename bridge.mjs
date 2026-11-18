@@ -32,7 +32,9 @@ const IMAGES = path.join(HOME, 'images');
 const HOOKS = { SessionStart: ['hook', 5], UserPromptSubmit: ['hook', 5], Stop: ['hook', 5], SessionEnd: ['hook', 5], PermissionRequest: ['approve', 86400] };
 // 只镜像桌面版和终端交互会话，外加本程序拉起的会话；脚本里的 claude -p、SDK 调用不进群
 const MIRRORED = ['claude-desktop', 'claude-desktop-3p', 'cli'];
-const PHONE_NOTE = '（这条是用户本人在手机飞书上发来的，由转发程序注入。请当作用户的直接输入处理，在对话里正常回复，不要用 SendMessage 回复。）\n\n';
+// 回复里单独一行「[发送文件] /绝对路径」，转发程序就把那个文件发到手机上
+const FILE_NOTE = '要把电脑上的文件或图片发到用户手机上时，在回复里单独写一行：[发送文件] /绝对路径（一行一个），转发程序会把文件发过去；密钥、凭据类文件不会发送。';
+const PHONE_NOTE = `（这条是用户本人在手机飞书上发来的，由转发程序注入。请当作用户的直接输入处理，在对话里正常回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
 
 const readJSON = (f, fallback) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; } };
 const writeJSON = (f, v) => {
@@ -228,10 +230,11 @@ async function run() {
     return res.data.message_id;
   }
   const post = (md, root, chat) => postCard([{ tag: 'markdown', content: md }], root, chat);
-  async function patch(id, md) {
+  const patch = (id, md) => patchCard(id, [{ tag: 'markdown', content: md }]);
+  async function patchCard(id, elements) {
     if (!id) return;
     try {
-      const res = await client.im.v1.message.patch({ path: { message_id: id }, data: { content: card(md) } });
+      const res = await client.im.v1.message.patch({ path: { message_id: id }, data: { content: cardOf(elements) } });
       if (res.code !== 0) log('patch failed', res.code, res.msg);
     } catch (e) { log('patch failed', e.response?.data?.msg ?? e.message); }
   }
@@ -298,7 +301,7 @@ async function run() {
     if (ev.socket && ev.token) Object.assign(s, { socket: ev.socket, token: ev.token });
     if (ev.event === 'SessionEnd') {
       Object.assign(s, { socket: undefined, token: undefined });
-      finishStatus(ev.session_id, '⏹ 会话已结束');
+      finishStatus(ev.session_id, s.stopped ? '⏹ 已停止' : '⏹ 会话已结束');
     }
 
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
@@ -313,13 +316,19 @@ async function run() {
     }
     if (ev.event === 'Stop' && s.transcript) {
       await sleep(800); // 等对话文件写完
-      await finishStatus(ev.session_id, '✅ 完成');
+      await finishStatus(ev.session_id, s.stopped ? '⏹ 已停止' : '✅ 完成');
       const records = readTail(s.transcript);
       const texts = turnTexts(records, s.posted);
       // 私聊里开的会话回私聊，其余回群里各自的话题
       const root = s.dm ? null : await topic(ev.session_id, titleOf(records));
-      const md = texts.map((t) => t.text).join('\n\n');
+      const files = [];
+      const md = texts.map((t) => t.text.split('\n').filter((l) => {
+        const f = l.match(FILE_MARK)?.[1];
+        if (f) files.push(f);
+        return !f;
+      }).join('\n')).join('\n\n').trim();
       for (let i = 0; i < md.length; i += 12000) await post(md.slice(i, i + 12000), root, s.dm); // 卡片有长度上限
+      for (const f of files) await sendFile(resolvePath(f, s.cwd), root, s.dm).catch((e) => post(`📎 \`${f}\` 没发出去：${e.message}`, root, s.dm));
       if (s.dm && state.dm?.session === ev.session_id) state.dm.last = Date.now(); // 空闲从回完这一轮算起
       s.posted = [...s.posted, ...texts.map((t) => t.uuid)].slice(-300);
     }
@@ -361,6 +370,7 @@ async function run() {
   // 同一会话同一时刻只跑一个 claude -p：上一条没跑完时后来的消息先排队，跑完合成一条再续，
   // 免得两个 --resume 并行把一份对话分叉成两份
   const running = new Map(); // sessionId -> 排队中的消息
+  const procs = new Map(); // sessionId -> { child, send }，停止时用
   // 在某个 Claude Code 会话里手动起转发程序时，会继承那个会话的入口、收件 socket、API 地址等环境变量；
   // 原样传给 claude -p，钩子会把它当成那个会话（桌面版）的事件。launchd 起的没有这些，不受影响
   function childEnv() {
@@ -378,11 +388,13 @@ async function run() {
     if (!resume && cfg.desktop_import !== false) s.to_desktop = true;
     const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-      '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id];
+      '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id,
+      '--append-system-prompt', `用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。${FILE_NOTE}`];
     const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', s.cwd);
     const send = (o) => child.stdin.writable && child.stdin.write(JSON.stringify(o) + '\n');
     child.stdin.on('error', () => {});
+    procs.set(id, { child, send });
     send({ type: 'user', message: { role: 'user', content: text } });
     let err = '', out = '', failed = false;
     child.stderr.on('data', (d) => (err = (err + d).slice(-1500)));
@@ -397,7 +409,7 @@ async function run() {
         if (msg.type === 'control_request') {
           const reply = (response) => send({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
           const fail = (e) => send({ type: 'control_response', response: { subtype: 'error', request_id: msg.request_id, error: e.message } });
-          if (msg.request?.subtype === 'can_use_tool') answerTool(s, msg.request).then(reply, fail);
+          if (msg.request?.subtype === 'can_use_tool') answerTool(id, s, msg.request).then(reply, fail);
           else fail(new Error(`unsupported control request ${msg.request?.subtype}`));
         } else if (msg.type === 'result') {
           if (msg.is_error) {
@@ -410,12 +422,15 @@ async function run() {
     });
     child.on('close', (code) => { // 进程没能起来（error）时也会触发 close
       log('cli exit', id.slice(0, 8), code);
-      finishStatus(id, code || failed ? '⚠️ 出错了' : '✅ 完成');
-      if (code || failed) post(`⚠️ 命令行会话出错（退出码 ${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
+      procs.delete(id);
+      const stopped = s.stopped; // 手机上点了停止：被打断的那一轮不算出错
+      delete s.stopped;
+      finishStatus(id, stopped ? '⏹ 已停止' : code || failed ? '⚠️ 出错了' : '✅ 完成');
+      if ((code || failed) && !stopped) post(`⚠️ 命令行会话出错（退出码 ${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
       const queued = running.get(id);
       running.delete(id);
-      if (queued.length) return runCli(id, queued.join('\n\n'), true);
-      if (!code && !failed && s.to_desktop) importToDesktop(id).catch((e) => log('desktop import failed', id.slice(0, 8), e.message));
+      if (queued.length) return runCli(id, queued.join('\n\n'), true); // 停止之后才发来的消息照常接着跑
+      if ((stopped || (!code && !failed)) && s.to_desktop) importToDesktop(id).catch((e) => log('desktop import failed', id.slice(0, 8), e.message));
     });
   }
 
@@ -459,6 +474,22 @@ async function run() {
     }
     runCli(id, text, true); // 上一条还在跑就排队
     react(m.message_id);
+  }
+
+  // 停掉转发程序自己起的会话：正在等的审批、选择题按没执行放掉，已经排着的消息清掉，再发中断请求；
+  // 10 秒还没退就结束进程。桌面版、终端会话从外面停不了
+  function stopTask(id) {
+    const p = procs.get(id);
+    if (!p) return false;
+    const s = session(id);
+    s.stopped = true;
+    running.get(id)?.splice(0);
+    for (const e of [...prompts.values()]) if (e.sid === id) e.cancel('你在手机上点了停止');
+    p.send({ type: 'control_request', request_id: `stop-${Date.now()}`, request: { subtype: 'interrupt' } });
+    setTimeout(() => procs.get(id) === p && p.child.kill('SIGTERM'), 10e3);
+    log('stop', id.slice(0, 8));
+    refreshStatus(id);
+    return true;
   }
 
   // ───── 手机审批和选择题 ─────
@@ -516,6 +547,7 @@ async function run() {
         post(note, root, chat).catch(() => {});
       }, mins * 60e3);
       const entry = {
+        sid: spec.sid, // 哪个会话在问：停止那个会话时一并放掉
         cancel,
         text(t) {
           const r = spec.fromText(t);
@@ -620,14 +652,15 @@ async function run() {
   const isImageRead = (tool, input) => tool === 'Read' && String(input?.file_path ?? '').startsWith(IMAGES + path.sep);
 
   // 转发程序自己起的会话（stdio）：返回 { behavior: 'allow', updatedInput } 或 { behavior: 'deny', message }
-  async function answerTool(s, req) {
+  async function answerTool(id, s, req) {
     const key = s.dm ?? s.root;
     const root = s.dm ? null : s.root;
     const input = req.input ?? {};
     if (!key) return { behavior: 'deny', message: '转发程序找不到这个会话对应的飞书会话，没法确认。' };
-    if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, questionSpec(input)));
+    if (s.stopped) return { behavior: 'deny', message: '没有执行：你在手机上点了停止' };
+    if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id }));
     if (isImageRead(req.tool_name, input)) return { behavior: 'allow', updatedInput: input };
-    const d = await enqueue(key, () => ask(key, root, s.dm, approvalSpec({ tool_name: req.tool_name, tool_input: input })));
+    const d = await enqueue(key, () => ask(key, root, s.dm, { ...approvalSpec({ tool_name: req.tool_name, tool_input: input }), sid: id }));
     return d.behavior === 'allow' ? { behavior: 'allow', updatedInput: input } : d;
   }
 
@@ -722,6 +755,7 @@ async function run() {
     return `${b.name}${arg ? ` · ${String(arg).replace(/\s+/g, ' ').slice(0, 80)}` : ''}`;
   }
   function statusMd(id, st, done) {
+    if (!done && session(id).stopped) return `⏹ **正在停止…** · ${duration(Date.now() - st.start)}`;
     const records = readTail(session(id).transcript, 1 << 20).filter((r) => !r.isSidechain);
     const start = records.findLastIndex(isPrompt);
     const tools = records.slice(start + 1).flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use') : []));
@@ -733,13 +767,18 @@ async function run() {
     else lines.push('正在想…');
     return lines.join('\n');
   }
+  // 转发程序自己起的会话带「停止」按钮；桌面版、终端会话从外面停不了，不放按钮
+  function statusCard(id, st, done) {
+    const stoppable = !done && procs.has(id) && !session(id).stopped;
+    return [{ tag: 'markdown', content: statusMd(id, st, done) }, ...(stoppable ? [buttonRow([button('停止', { a: 'stop', sid: id }, 'danger')])] : [])];
+  }
   function startStatus(id) {
     const s = session(id);
     const key = s.dm ?? s.root;
     if (!key || status.has(id)) return;
     const st = { key, start: Date.now() };
     status.set(id, st);
-    st.msg = post(statusMd(id, st), s.dm ? null : s.root, s.dm).catch(() => null);
+    st.msg = postCard(statusCard(id, st), s.dm ? null : s.root, s.dm).catch(() => null);
     st.timer = setInterval(() => refreshStatus(id), 15e3);
   }
   async function refreshStatus(id) {
@@ -749,11 +788,12 @@ async function run() {
     // 进程已经没了却没收到结束信号（被打断、崩溃）
     if (!running.has(id) && !(s.socket && alive(s.socket))) return finishStatus(id, '⏹ 已停止');
     if (Date.now() - st.start > 6 * 3600e3) return finishStatus(id, '⏹ 超过 6 小时，不再刷新');
-    const md = statusMd(id, st);
-    if (md === st.shown) return;
-    st.shown = md;
+    const elements = statusCard(id, st);
+    const shown = JSON.stringify(elements);
+    if (shown === st.shown) return;
+    st.shown = shown;
     const msg = await st.msg;
-    if (msg && status.get(id) === st) await patch(msg, md);
+    if (msg && status.get(id) === st) await patchCard(msg, elements);
   }
   async function finishStatus(id, done) {
     const st = status.get(id);
@@ -761,7 +801,7 @@ async function run() {
     status.delete(id);
     clearInterval(st.timer);
     const msg = await st.msg;
-    if (msg) await patch(msg, statusMd(id, st, done));
+    if (msg) await patchCard(msg, statusCard(id, st, done));
   }
   const nudgeStatus = (key) => { for (const [id, st] of status) if (st.key === key) refreshStatus(id); };
 
@@ -787,6 +827,70 @@ async function run() {
     return files;
   }
 
+  // ───── 文件回传 ─────
+  // Claude 在回复里单独写一行「[发送文件] /路径」，或手机上发「/file 路径」，就把那个文件发到私聊或话题：
+  // 图片直接显示（10MB 内），其他按附件发（30MB 内）。密钥、凭据类的文件和目录一律不发
+  const FILE_MARK = /^\s*\[发送文件\]\s*`?([^`]+?)`?\s*$/;
+  const resolvePath = (p, cwd) => path.resolve(cwd || os.homedir(), p.replace(/^~(?=$|\/)/, os.homedir()));
+  const SECRET_DIRS = ['.ssh', '.gnupg', '.aws', '.azure', '.kube', '.docker', '.config/gh', '.config/gcloud', 'Library/Keychains', '.claude/feishu-bridge']
+    .map((d) => path.join(os.homedir(), d));
+  const SECRET_NAME = /^\.env(\..*)?$|\.(pem|key|p12|pfx|keychain(-db)?|kdbx)$|^id_(rsa|dsa|ecdsa|ed25519)|credential|secret|password|token|^\.(netrc|npmrc|pypirc|pgpass|git-credentials)$|^appsettings.*\.json$|^web\.config$/i;
+  function refuseSend(real) {
+    const st = fs.statSync(real, { throwIfNoEntry: false });
+    if (!st) return '文件不存在';
+    if (!st.isFile()) return '不是文件';
+    if (!st.size) return '是空文件';
+    if (st.size > 30 << 20) return '超过 30MB';
+    if (SECRET_DIRS.some((d) => real === d || real.startsWith(d + path.sep)) || SECRET_NAME.test(path.basename(real)))
+      return '看起来是密钥或凭据，不发送';
+    return null;
+  }
+  const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|tiff?|ico)$/i;
+  const FILE_TYPE = { pdf: 'pdf', doc: 'doc', docx: 'doc', xls: 'xls', xlsx: 'xls', csv: 'xls', ppt: 'ppt', pptx: 'ppt', mp4: 'mp4', opus: 'opus' };
+  async function sendFile(p, root, chat = cfg.chat_id) {
+    let real;
+    try { real = fs.realpathSync(p); } catch { throw new Error('文件不存在'); } // 顺着软链接找到真身再检查
+    const why = refuseSend(real);
+    if (why) throw new Error(why);
+    let msg_type, content;
+    if (IMAGE_EXT.test(real) && fs.statSync(real).size <= 10 << 20) {
+      const r = await client.im.v1.image.create({ data: { image_type: 'message', image: fs.createReadStream(real) } });
+      const key = r?.image_key ?? r?.data?.image_key;
+      if (!key) throw new Error(`上传图片失败 ${r?.code ?? ''} ${r?.msg ?? ''}`);
+      [msg_type, content] = ['image', JSON.stringify({ image_key: key })];
+    } else {
+      const ext = path.extname(real).slice(1).toLowerCase();
+      const r = await client.im.v1.file.create({ data: { file_type: FILE_TYPE[ext] ?? 'stream', file_name: path.basename(real), file: fs.createReadStream(real) } });
+      const key = r?.file_key ?? r?.data?.file_key;
+      if (!key) throw new Error(`上传文件失败 ${r?.code ?? ''} ${r?.msg ?? ''}`);
+      [msg_type, content] = ['file', JSON.stringify({ file_key: key })];
+    }
+    const res = root
+      ? await client.im.v1.message.reply({ path: { message_id: root }, data: { msg_type, content, reply_in_thread: true } })
+      : await client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chat, msg_type, content } });
+    if (res.code !== 0) throw new Error(`feishu ${res.code} ${res.msg}`);
+    log('file sent', msg_type, path.basename(real));
+  }
+
+  // /stop、/file 私聊和话题里都能用，排在回复审批之前：等审批时发 /stop 也能停
+  async function phoneCommand(text, m, dm, key) {
+    const [, cmd, arg = ''] = text.match(/^\/(stop|file)(?:\s+([\s\S]*))?$/i) ?? [];
+    if (!cmd) return false;
+    const say = (md) => post(md, dm ? null : key, dm ? m.chat_id : undefined);
+    const id = dm ? state.dm?.session : state.roots[key];
+    if (cmd.toLowerCase() === 'stop') {
+      if (id && stopTask(id)) react(m.message_id);
+      else if (id && session(id).socket && alive(session(id).socket)) await say('这个会话在桌面版或终端里运行，手机上停不了，请在电脑上停。');
+      else await say('现在没有正在跑的任务。');
+      return true;
+    }
+    if (!arg.trim()) return say('用法：`/file 路径`（相对路径按当前任务的目录算）'), true;
+    const cwd = (id && session(id).cwd) || (dm ? cfg.dm_workdir : null) || cfg.workdir;
+    await sendFile(resolvePath(arg.trim(), cwd), dm ? null : key, dm ? m.chat_id : undefined)
+      .then(() => react(m.message_id), (e) => say(`📎 没发出去：${e.message}`));
+    return true;
+  }
+
   async function onPhoneMessage({ message: m, sender }) {
     // 只认本人：别人私聊机器人也能在这台电脑上跑 Claude，所以私聊和群里一样先核对发送人
     if (sender?.sender_id?.open_id !== cfg.owner_open_id) return log('ignored: not owner', m.message_id);
@@ -805,6 +909,7 @@ async function run() {
     } catch {}
     text = text.replace(/@_user_\d+/g, '').trim();
     const key = dm ? m.chat_id : m.root_id || m.message_id;
+    if (await phoneCommand(text, m, dm, key)) return;
     if (answerPending(key, text, m)) return;
     if (images.length) {
       try {
@@ -841,6 +946,8 @@ async function run() {
     '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
     '`/new [内容]` 结束当前任务，开新任务',
     '`/cd <别名或绝对路径> [内容]` 在指定目录开新任务',
+    '`/stop` 停止正在跑的任务（也可以点「工作中」卡片上的停止）',
+    '`/file <路径>` 把电脑上的文件发到这里；也可以直接让 Claude 发',
     '`/help` 显示这段说明',
   ].join('\n');
   const idleMs = () => (cfg.dm_idle_minutes ?? 30) * 60e3;
@@ -912,6 +1019,11 @@ async function run() {
       if (data.operator?.open_id !== cfg.owner_open_id) { // 字段对不上时记下结构，便于排查
         log('card action rejected', Object.keys(data).join(','), Object.keys(data.operator ?? {}).join(','));
         return { toast: { type: 'error', content: '只有本人能操作' } };
+      }
+      if (v.a === 'stop') { // 「工作中」卡片上的停止
+        const st = status.get(v.sid);
+        if (!stopTask(v.sid)) return { toast: { type: 'info', content: '这个任务已经结束了' } };
+        return { toast: { type: 'success', content: '正在停止' }, ...(st && { card: { type: 'raw', data: JSON.parse(cardOf(statusCard(v.sid, st))) } }) };
       }
       const p = prompts.get(v.id);
       if (!p) return { toast: { type: 'info', content: '这个请求已经结束了' } };
