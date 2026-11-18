@@ -257,6 +257,19 @@ async function run() {
       return buf.toString('utf8').split('\n').slice(size > buf.length ? 1 : 0).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
     } catch { return []; }
   }
+  // 读对话文件 offset 之后新写的记录（「工作中」卡片按这一轮开始时的文件长度划分轮次）
+  function readFrom(file, offset) {
+    try {
+      const fd = fs.openSync(file, 'r');
+      const size = fs.fstatSync(fd).size;
+      const from = Math.max(offset, size - (4 << 20));
+      const buf = Buffer.alloc(Math.max(0, size - from));
+      fs.readSync(fd, buf, 0, buf.length, from);
+      fs.closeSync(fd);
+      return buf.toString('utf8').split('\n').slice(from > offset ? 1 : 0).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
+    } catch { return []; }
+  }
+  const sizeOf = (file) => { try { return fs.statSync(file).size; } catch { return 0; } };
   // 会话标题：桌面版和终端都会往对话文件里写 custom-title / ai-title
   const titleOf = (records) => records.findLast((r) => r.customTitle)?.customTitle ?? records.findLast((r) => r.aiTitle)?.aiTitle;
   // 用户输入（一轮的开头）：真人打的字或排队进来的消息，不算工具结果
@@ -271,7 +284,7 @@ async function run() {
     for (const r of records) {
       if (r.isSidechain) continue;
       const c = r.message?.content;
-      if (isPrompt(r)) out = [];
+      if (isPrompt(r) && r.type === 'user') out = []; // 插话（queued_command）不算新一轮，前面说的话照样发
       else if (r.type === 'assistant' && Array.isArray(c) && !posted.includes(r.uuid)) {
         const text = c.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
         if (text) out.push({ uuid: r.uuid, text });
@@ -308,6 +321,15 @@ async function run() {
 
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
       const i = s.pending.findIndex((t) => ev.prompt.includes(t));
+      // 手机上插话进正在跑的那一轮：同一轮接着用原来的「工作中」卡片，不另起
+      const mid = i >= 0 ? (s.midturn?.indexOf(s.pending[i]) ?? -1) : -1;
+      if (mid >= 0) {
+        s.midturn.splice(mid, 1);
+        if (status.has(ev.session_id)) {
+          s.pending.splice(i, 1);
+          return save();
+        }
+      }
       // phone 记下这一轮是谁发起的：手机发起的那一轮，权限确认才转到手机
       s.phone = i >= 0;
       await finishStatus(ev.session_id, '⏹ 已结束'); // 上一轮被中断时收不到 Stop
@@ -393,13 +415,24 @@ async function run() {
     if (!resume && cfg.desktop_import !== false) s.to_desktop = true;
     const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-      '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id,
+      '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id, '--replay-user-messages',
       '--append-system-prompt', `用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。${PLAN_NOTE}${FILE_NOTE}`];
     const child = spawn(cfg.claude, args, { cwd: s.cwd || cfg.workdir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', s.cwd);
     const send = (o) => child.stdin.writable && child.stdin.write(JSON.stringify(o) + '\n');
     child.stdin.on('error', () => {});
-    procs.set(id, { child, send });
+    // sent / taken：写进去几条、CLI 开始处理（回显）了几条。全都处理完的那次 result 才关输入，
+    // 关之前插话直接写进去，Claude 下一步之前就能看到；said：Claude 最近说的一句话，审批卡片上当理由
+    const p = { child, send, sent: 1, taken: 0, ending: false, said: '' };
+    p.inject = (t) => {
+      if (p.ending || s.stopped) return false;
+      s.pending.push(t);
+      (s.midturn ??= []).push(t);
+      p.sent++;
+      send({ type: 'user', message: { role: 'user', content: t } });
+      return true;
+    };
+    procs.set(id, p);
     send({ type: 'user', message: { role: 'user', content: text } });
     let err = '', out = '', failed = false;
     child.stderr.on('data', (d) => (err = (err + d).slice(-1500)));
@@ -416,18 +449,26 @@ async function run() {
           const fail = (e) => send({ type: 'control_response', response: { subtype: 'error', request_id: msg.request_id, error: e.message } });
           if (msg.request?.subtype === 'can_use_tool') answerTool(id, s, msg.request).then(reply, fail);
           else fail(new Error(`unsupported control request ${msg.request?.subtype}`));
+        } else if (msg.type === 'user' && msg.isReplay) {
+          p.taken++;
+        } else if (msg.type === 'assistant' && Array.isArray(msg.message?.content)) {
+          const said = msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+          if (said) p.said = said;
         } else if (msg.type === 'result') {
           if (msg.is_error) {
             failed = true;
             err = String(msg.result ?? msg.subtype ?? 'error').slice(-1500) + (err ? `\n\n${err}` : '');
           }
-          child.stdin.end();
+          // 还有写进去没开始处理的（紧贴着结束发来的），CLI 会接着另起一轮，等它那次 result；一分钟没动静也关
+          if (p.taken >= p.sent || s.stopped) p.ending = true, child.stdin.end();
+          else setTimeout(() => !p.ending && (p.ending = true, child.stdin.end()), 60e3);
         }
       }
     });
     child.on('close', (code) => { // 进程没能起来（error）时也会触发 close
       log('cli exit', id.slice(0, 8), code);
       procs.delete(id);
+      delete s.midturn;
       const stopped = s.stopped; // 手机上点了停止：被打断的那一轮不算出错
       delete s.stopped;
       finishStatus(id, stopped ? '⏹ 已停止' : code || failed ? '⚠️ 出错了' : '✅ 完成');
@@ -477,7 +518,8 @@ async function run() {
       }
       Object.assign(s, { socket: undefined, token: undefined }); // 进程已经退了（没赶上报 SessionEnd 时）
     }
-    runCli(id, text, true); // 上一条还在跑就排队
+    // 手机开的会话还在跑：直接递进去，不用等这一轮做完；进程正在收尾时排队，跑完接着续
+    if (!procs.get(id)?.inject(text)) runCli(id, text, true);
     react(m.message_id);
   }
 
@@ -571,7 +613,8 @@ async function run() {
     });
   }
 
-  function describe({ tool_name: tool, tool_input: input = {} }) {
+  // reason：Claude 执行前说的那句话，放在卡片上帮你判断
+  function describe({ tool_name: tool, tool_input: input = {} }, reason) {
     let body;
     // 命令不截断：截掉尾巴可能正好藏着危险部分
     if (tool === 'Bash') body = '```\n' + input.command + '\n```' + (input.description ? `\n${input.description}` : '');
@@ -579,12 +622,13 @@ async function run() {
       const content = input.content ?? input.new_string;
       body = `\`${input.file_path}\`` + (content ? '\n```\n' + clip(content) + '\n```' : '');
     } else body = '```\n' + clip(JSON.stringify(input, null, 2)) + '\n```';
-    return `🔐 **需要确认：${tool}**\n${body}`;
+    const why = reason ? `💬 ${clip(reason.replace(/\n{2,}/g, '\n'), 400)}\n` : '';
+    return `🔐 **需要确认：${tool}**\n${why}${body}`;
   }
   const refused = (said) => ({ behavior: 'deny', message: said ? `用户在手机上拒绝了，并说：${said}` : '用户在手机上拒绝了。' });
   // hook：桌面版、终端会话。电脑上同时也弹了确认，哪边先答算哪边；手机这边到点或被放掉时不表态，交给电脑
-  const approvalSpec = (req, hook) => ({
-    body: describe(req),
+  const approvalSpec = (req, hook, reason) => ({
+    body: describe(req, reason),
     hint: (mins) => '点按钮，或回复 **y** 允许、**n** 拒绝；直接说别的也算拒绝，并把你的话转给 Claude。' +
       (hook ? '电脑上也弹了确认，哪边先答算哪边。' : '') + (mins ? `${mins} 分钟内不回${hook ? '就交给电脑' : '按拒绝'}。` : ''),
     controls: (id) => [buttonRow([button('允许', { a: 'allow', id }, 'primary_filled'), button('拒绝', { a: 'deny', id }, 'danger')])],
@@ -665,7 +709,7 @@ async function run() {
     if (s.stopped) return { behavior: 'deny', message: '没有执行：你在手机上点了停止' };
     if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id }));
     if (isImageRead(req.tool_name, input)) return { behavior: 'allow', updatedInput: input };
-    const d = await enqueue(key, () => ask(key, root, s.dm, { ...approvalSpec({ tool_name: req.tool_name, tool_input: input }), sid: id }));
+    const d = await enqueue(key, () => ask(key, root, s.dm, { ...approvalSpec({ tool_name: req.tool_name, tool_input: input }, false, procs.get(id)?.said), sid: id }));
     return d.behavior === 'allow' ? { behavior: 'allow', updatedInput: input } : d;
   }
 
@@ -694,6 +738,17 @@ async function run() {
     return () => clearInterval(timer);
   }
 
+  // 这一轮里 Claude 最近说的一句话（桌面版、终端会话从对话记录里找）
+  function lastSaid(s) {
+    const records = readTail(s.transcript, 1 << 20).filter((r) => !r.isSidechain);
+    for (let i = records.length - 1; i >= 0 && !(isPrompt(records[i]) && records[i].type === 'user'); i--) {
+      const c = records[i].type === 'assistant' && records[i].message?.content;
+      const said = Array.isArray(c) ? c.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim() : '';
+      if (said) return said;
+    }
+    return '';
+  }
+
   // 桌面版、终端会话（PermissionRequest 钩子）：返回 { behavior, message? }；返回 null 表示不表态，交给电脑上的弹窗。
   // 电脑上同时也在弹确认：那边先答了、或钩子进程没了（会话退出、钩子到时），手机上的卡片放掉
   async function decide(req, gone) {
@@ -712,7 +767,7 @@ async function run() {
     gone.addEventListener('abort', () => ctl.abort('会话那边已经不等了'));
     const stop = watchAnswered(s, req, ctl);
     try {
-      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...approvalSpec(req, true), signal: ctl.signal }));
+      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...approvalSpec(req, true, lastSaid(s)), signal: ctl.signal }));
     } finally { stop(); }
   }
 
@@ -833,8 +888,8 @@ async function run() {
   function statusMd(id, st, done) {
     if (!done && session(id).stopped) return `⏹ **正在停止…** · ${duration(Date.now() - st.start)}`;
     const records = readTail(session(id).transcript, 1 << 20).filter((r) => !r.isSidechain);
-    const start = records.findLastIndex(isPrompt);
-    const turn = records.slice(start + 1);
+    const turn = readFrom(session(id).transcript, st.offset ?? 0).filter((r) => !r.isSidechain);
+    const start = records.length - turn.length - 1; // records 里这一轮之前的最后一条
     // 列计划、查工具这些不算干活，不计数也不列进步骤
     const tools = turn.flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use' && !PLAN_TOOLS.test(b.name)) : []));
     const results = new Map(turn.flatMap((r) => (r.type === 'user' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_result').map((b) => [b.tool_use_id, b]) : [])));
@@ -858,7 +913,7 @@ async function run() {
     const s = session(id);
     const key = s.dm ?? s.root;
     if (!key || status.has(id)) return;
-    const st = { key, start: Date.now() };
+    const st = { key, start: Date.now(), offset: sizeOf(s.transcript) }; // 这一轮的输入还没写进对话文件，按此刻的长度划界
     status.set(id, st);
     st.msg = postCard(statusCard(id, st), s.dm ? null : s.root, s.dm).catch(() => null);
     st.timer = setInterval(() => refreshStatus(id), 15e3);
