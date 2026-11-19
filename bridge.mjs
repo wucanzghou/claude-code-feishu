@@ -51,6 +51,7 @@ const SECRETARY_NOTE = [
   '小事（几次工具调用就能查清、答清的）自己做；大活（耗时、多步骤、要改代码、要排查的）用 mcp__feishu__start_task 派给一个新的 Claude 会话，它在飞书群里单独开一个话题做，过程都留在那个话题里。',
   '派活说明要自成一体：干活的会话看不到这里的对话。写清目标、背景、涉及的文件或系统、完成标准和限制（只读还是可以改代码；除非用户明确要求，不 commit、不 push、不改生产数据、不对外发消息）。会改文件的任务 edits_code 填 true。改代码的任务可以同时派好几个；它们改到同一处打架时，再让它们各自建 git worktree。',
   '派活和追加指示都要用户在私聊里点按钮确认才执行。调完工具就简短告诉用户派了什么，结束这一轮，不要等结果；任务做完、出错或等用户确认时，转发程序会直接通知用户。',
+  '用户指定用哪个模型或权限模式派活时，start_task 填 model / permission_mode；没指定就不填。用户想改以后默认的模型、模式，告诉他在私聊发 /model、/mode。',
   '用户问进展时用 list_tasks / task_detail 查；给任务补充指示用 send_to_task（也能递给电脑上开着的桌面会话）；要停用 stop_task。',
   '汇报照实说：没查到就说没查到，没做完就说没做完，不要编。说话简短口语化，像发微信，少用表格和长清单。',
 ].join('\n');
@@ -68,6 +69,8 @@ const TASK_TOOLS = [
         brief: { type: 'string', description: '完整的派活说明：目标、背景、涉及的文件或系统、完成标准、限制。干活的会话只看得到这段话' },
         edits_code: { type: 'boolean', description: '会不会改文件或代码' },
         cwd: { type: 'string', description: '工作目录：配置里的项目别名或绝对路径；不填用默认目录' },
+        model: { type: 'string', enum: ['opus', 'sonnet', 'haiku', 'fable'], description: '用户指定了模型才填；不填用默认' },
+        permission_mode: { type: 'string', enum: ['auto', 'acceptEdits', 'manual', 'plan', 'bypassPermissions'], description: '用户指定了权限模式才填；不填用默认' },
       },
       required: ['title', 'brief', 'edits_code'],
     },
@@ -308,6 +311,24 @@ async function run() {
   const state = readJSON(STATE, { sessions: {}, roots: {} });
   const save = () => writeJSON(STATE, state);
   const session = (id) => (state.sessions[id] ??= { posted: [], pending: [] });
+  // ───── 模型和模式 ─────
+  // 转发程序自己起的会话（手机开的话题、派出去的任务、秘书）按这里选的模型和权限模式跑，下一轮生效。
+  // 话题里 /model、/mode 改那个话题的会话；私聊里改默认（秘书和以后新开的会话；话题里单独选过的不变）。
+  // 开在桌面版里的会话由桌面版跑，要在电脑上切；它关掉后再从手机续跑时用这里选的。
+  // 「默认」= 不传 --model，用电脑上 Claude Code 的设置
+  const MODELS = [['默认', ''], ['Opus', 'opus[1m]'], ['Sonnet', 'sonnet'], ['Haiku', 'haiku'], ['Fable', 'fable']];
+  const MODES = [['auto', '自动'], ['acceptEdits', '改文件不问'], ['manual', '每步都问'], ['plan', '只出方案'], ['bypassPermissions', '全部放行']];
+  const defaults = () => (state.defaults ??= {});
+  const modelOf = (s) => s?.model ?? defaults().model ?? cfg.model ?? '';
+  const modeOf = (s) => s?.mode ?? ((s?.dm && cfg.dm_permission_mode) || defaults().mode || cfg.permission_mode);
+  const modelName = (v) => MODELS.find(([, x]) => x === v)?.[0] ?? (v || '默认');
+  const modeName = (v) => MODES.find(([x]) => x === v)?.[1] ?? v;
+  // 手机上打的名字：Sonnet、sonnet、默认、default；模式也认中文
+  const parsePick = (k, arg) => {
+    const a = arg.trim().toLowerCase();
+    if (k === 'model') return /^(默认|default)$/.test(a) ? '' : MODELS.find(([n, v]) => n.toLowerCase() === a || v === a || v.replace('[1m]', '') === a)?.[1];
+    return MODES.find(([v, n]) => v.toLowerCase() === a || n === arg.trim())?.[0];
+  };
 
   const cardOf = (elements) => JSON.stringify({ schema: '2.0', body: { elements } });
   const card = (md) => cardOf([{ tag: 'markdown', content: md }]);
@@ -569,11 +590,12 @@ async function run() {
     // 秘书不导入桌面：桌面版接着聊时没有派活工具，私聊消息还会被送到桌面那边去。
     // 派出去的任务和手机开的会话一样，第一轮做完就导入（每做完一个桌面窗口会切过去一次）
     if (!resume && cfg.desktop_import !== false && !s.secretary) s.to_desktop = true;
-    const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
+    const mode = modeOf(s), model = modelOf(s);
     const role = s.secretary ? SECRETARY_NOTE : s.task ? WORKER_NOTE : '用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。';
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id, '--replay-user-messages',
       '--append-system-prompt', `${role}\n${PLAN_NOTE}${FILE_NOTE}`];
+    if (model) args.push('--model', model);
     // 派活工具只给秘书；这几个工具本身不做危险的事（派活、递话由转发程序在私聊里让你点确认），放行免得再问一遍
     if (s.secretary) args.push('--mcp-config', JSON.stringify({ mcpServers: { feishu: { type: 'stdio', command: process.execPath, args: [SELF, 'mcp'] } } }),
       '--allowedTools', TASK_TOOLS.map((t) => `mcp__feishu__${t.name}`).join(','));
@@ -1344,7 +1366,10 @@ async function run() {
     const cwd = where ? (cfg.projects?.[where] ?? (path.isAbsolute(where) ? where : '')) : cfg.workdir;
     if (!cwd || !fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) return { error: `没有这个目录或别名：${where}` };
     if (!dmChat()) return { error: '用户还没私聊过机器人，没地方发确认' };
-    const d = { kind: 'start', title, brief, cwd, edits: a.edits_code === true, by: state.dm?.session, at: Date.now() };
+    const model = a.model ? parsePick('model', String(a.model)) : undefined, mode = a.permission_mode ? parsePick('mode', String(a.permission_mode)) : undefined;
+    if (a.model && model === undefined) return { error: `没有这个模型：${a.model}` };
+    if (a.permission_mode && mode === undefined) return { error: `没有这个模式：${a.permission_mode}` };
+    const d = { kind: 'start', title, brief, cwd, edits: a.edits_code === true, by: state.dm?.session, at: Date.now(), ...(model !== undefined && { model }), ...(mode && { mode }) };
     const busy = whyBusy();
     if (busy) return { error: busy };
     if (cfg.dispatch_confirm === false) {
@@ -1354,7 +1379,7 @@ async function run() {
     const key = askKey();
     (state.asks ??= {})[key] = d;
     save();
-    await postParts(`📋 **秘书要派活：${title}**\n目录 \`${tilde(cwd)}\` · ${d.edits ? '会改代码' : '不改代码'}\n\n${brief}`,
+    await postParts(`📋 **秘书要派活：${title}**\n目录 \`${tilde(cwd)}\` · ${d.edits ? '会改代码' : '不改代码'} · 模型 ${modelName(d.model ?? modelOf(null))} · 模式 ${modeName(d.mode ?? modeOf(null))}\n\n${brief}`,
       [buttonRow([button('派', { a: 'dispatch', id: key }, 'primary_filled'), button('不派', { a: 'nodispatch', id: key })])], dmChat());
     return { text: `派活卡片已发到用户私聊，用户点「派」后「${title}」才开始。不用等，简短告诉用户派了什么就结束这一轮；做完转发程序会直接通知用户。` };
   }
@@ -1362,7 +1387,8 @@ async function run() {
   async function startDispatched(d) {
     const id = crypto.randomUUID();
     const root = await post(`📋 **${d.title}**\n\`${tilde(d.cwd)}\` · 秘书派的活${d.edits ? ' · 会改代码' : ''}`); // 群里开新话题
-    Object.assign(session(id), { root, title: d.title, cwd: d.cwd, home: d.cwd, notify: true, task: { by: d.by, brief: d.brief, edits: d.edits, started: Date.now() } });
+    Object.assign(session(id), { root, title: d.title, cwd: d.cwd, home: d.cwd, notify: true, task: { by: d.by, brief: d.brief, edits: d.edits, started: Date.now() },
+      ...(d.model !== undefined && { model: d.model }), ...(d.mode && { mode: d.mode }) });
     state.roots[root] = id;
     save();
     for (const part of chunks(`**派活说明**\n\n${d.brief}`)) await post(part, root);
@@ -1581,11 +1607,46 @@ async function run() {
     log('file sent', msg_type, path.basename(real));
   }
 
-  // /stop、/file 私聊和话题里都能用，排在回复审批之前：等审批时发 /stop 也能停
+  // 选模型、模式的卡片：私聊里是默认，话题里是那个话题的会话
+  function pickCard(t) {
+    const s = t.id ? state.sessions[t.id] : null;
+    const model = s ? modelOf(s) : defaults().model ?? cfg.model ?? '';
+    const mode = s ? modeOf(s) : defaults().mode || cfg.permission_mode;
+    const notes = [];
+    if (s && running.has(t.id)) notes.push('正在跑的这一轮不变，下一条消息开始生效。');
+    if (s && !procs.has(t.id) && s.socket && alive(s.socket)) notes.push('这个会话现在开在桌面版里，由桌面版跑，要在电脑上切；它关掉后再从这里续跑时用这里选的。');
+    const val = (k, v) => ({ a: 'pick', k, v, sid: t.id ?? '' });
+    return [
+      { tag: 'markdown', content: `⚙️ **${s ? '这个话题的会话' : '默认'}**${s ? '' : '（秘书和以后新开的会话；话题里单独选过的不变）'}\n模型 **${modelName(model)}** · 模式 **${modeName(mode)}**${notes.length ? `\n${notes.join('\n')}` : ''}` },
+      { tag: 'markdown', content: '模型（「默认」用电脑上的设置）' },
+      buttonRow(MODELS.map(([n, v]) => button(n, val('model', v), v === model ? 'primary_filled' : 'default'))),
+      { tag: 'markdown', content: '权限模式' },
+      buttonRow(MODES.map(([v, n]) => button(n, val('mode', v), v === mode ? 'primary_filled' : 'default'))),
+    ];
+  }
+  function setPick(t, k, v) {
+    const o = t.id ? session(t.id) : defaults();
+    o[k] = v;
+    save();
+    log('pick', t.id?.slice(0, 8) ?? 'default', k, v);
+  }
+
+  // /stop、/file、/model、/mode 私聊和话题里都能用，排在回复审批之前：等审批时发 /stop 也能停
   async function phoneCommand(text, m, dm, key) {
-    const [, cmd, arg = ''] = text.match(/^\/(stop|file)(?:\s+([\s\S]*))?$/i) ?? [];
+    const [, cmd, arg = ''] = text.match(/^\/(stop|file|model|mode)(?:\s+([\s\S]*))?$/i) ?? [];
     if (!cmd) return false;
     const say = (md) => post(md, dm ? null : key, dm ? m.chat_id : undefined);
+    if (/^mode?l?$/i.test(cmd)) {
+      const k = cmd.toLowerCase();
+      const sid = dm ? null : state.roots[key];
+      if (!dm && !state.sessions[sid]) return say('这个话题还没有会话，先发任务内容开一个；或者在私聊里发 /model、/mode 改默认。'), true;
+      const t = { id: sid };
+      if (!arg.trim()) return postCard(pickCard(t), dm ? null : key, dm ? m.chat_id : undefined), true;
+      const v = parsePick(k, arg);
+      if (v === undefined) return say(k === 'model' ? `没有这个模型：${arg.trim()}。可选：${MODELS.map((x) => x[0]).join(' / ')}` : `没有这个模式：${arg.trim()}。可选：${MODES.map(([v, n]) => `${v}（${n}）`).join(' / ')}`), true;
+      setPick(t, k, v);
+      return say(`⚙️ ${dm ? '默认' : '这个话题'}的${k === 'model' ? '模型' : '模式'}改成 **${k === 'model' ? modelName(v) : modeName(v)}**，下一轮生效。`), true;
+    }
     const id = dm ? state.dm?.session : state.roots[key];
     if (cmd.toLowerCase() === 'stop') {
       if (id && stopTask(id)) react(m.message_id);
@@ -1690,6 +1751,7 @@ async function run() {
     `\`/cd <别名或绝对路径> [内容]\` 在指定目录开新${secretaryOn() ? '的秘书会话' : '任务'}`,
     '`/stop` 停止正在跑的那一轮（也可以点「工作中」卡片上的停止）',
     '`/file <路径>` 把电脑上的文件发到这里；也可以直接让 Claude 发',
+    '`/model`、`/mode` 选默认的模型、权限模式（话题里发就是只改那个话题），也可以直接写 `/model sonnet`、`/mode plan`',
     '`/help` 显示这段说明',
   ].join('\n');
   const idleMs = () => (cfg.dm_idle_minutes ?? 30) * 60e3;
@@ -1970,6 +2032,12 @@ async function run() {
         return { toast: { type: 'success', content: '正在停止' }, ...(st && { card: { type: 'raw', data: JSON.parse(cardOf(statusCard(v.sid, st))) } }) };
       }
       if (/^(no)?(dispatch|send)$/.test(v.a)) return answerAsk(v); // 秘书派活、递话的确认
+      if (v.a === 'pick') { // 选模型、模式
+        if (v.sid && !state.sessions[v.sid]) return { toast: { type: 'info', content: '找不到这个会话' } };
+        const t = { id: v.sid || null };
+        setPick(t, v.k, v.v);
+        return { toast: { type: 'success', content: `${v.k === 'model' ? '模型' : '模式'}改成 ${v.k === 'model' ? modelName(v.v) : modeName(v.v)}，下一轮生效` }, card: { type: 'raw', data: JSON.parse(cardOf(pickCard(t))) } };
+      }
       if (v.a === 'board') { // 大屏上的「刷新」：直接换成最新内容
         const current = state.board?.msg === data.context?.open_message_id;
         const md = boardMd();
