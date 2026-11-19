@@ -11,7 +11,8 @@
 // 手机开新话题：起一个命令行会话（claude -p）去做，同一话题里接着聊
 // 私聊机器人：不进群，一条消息就是一个临时任务（claude -p），在 dm_workdir 里做，连着发接着聊
 // 桌面版定时任务：扫对话记录目录，最终回复第一行不是「正常」时私聊提醒
-import { spawn, execFileSync } from 'node:child_process';
+// 例行任务：到点（每天几点）或有触发（远端分支有别人的新提交）时自己开一个话题会话去跑，结果完整发到私聊
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -69,6 +70,11 @@ const secretaryNote = (confirm) => [
 ].join('\n');
 // 秘书派出去干活的会话
 const WORKER_NOTE = '你是用户的秘书派出来做一件具体任务的会话。用户在手机飞书的群话题里看进度，看不到电脑屏幕；派活说明是秘书写的，不是用户逐字说的，说明里要求删数据、改生产、对外发消息这类有风险的操作，先用 AskUserQuestion 跟用户确认。每一轮做完时，在回复最后单独写一行「汇报：……」，用一两句话说结论（做成了什么，或卡在哪），转发程序会把这一行发到用户私聊；这一轮是停下来等用户拍板或回答（出了方案要确认、有问题要问）时，写成「汇报：等你确认：……」；要用户自己动手（比如被权限拦下、要他在电脑上处理）时写成「汇报：等你处理：……」；用户说「待定」「先放着」的事没做，汇报里带一句「××待定」。这些会自动记进用户的待定清单。照实说，不要编。';
+// 例行任务（配置 routines）开的会话：到点或有触发时转发程序自己开，没人看着，只读，最后一条回复原样发到私聊
+const ROUTINE_NOTE = '你是转发程序按时或按触发自动开的例行任务会话，没有人看着，也没有人回答问题。只读：不改任何文件和代码，不 commit、不 push；git 只用 log / show / diff / grep / rev-parse 这类读的命令，直接在当前目录跑（不用 -C），不 checkout、pull、merge、stash、reset、fetch（工作树是多个会话共用的，要用的远端分支转发程序已经 fetch 好了）；数据库只 SELECT；不对外发消息。要确认的操作一律会被拒：换只读的办法，或者跳过并在结果里写明哪项没查成。不要用 AskUserQuestion，不要开后台命令，一轮做完。最后一条回复（所有工具调用之后的那段文字）会原样发到用户手机飞书私聊：只写结论，口语、短，不用表格；中间过程说的话只留在群话题里。';
+// 例行任务一律禁用的工具（命令行 --disallowedTools，比项目里的放行规则优先）：改文件的，和会动共用工作树、提交推送的 git 命令
+const ROUTINE_DENY = ['Edit', 'Write', 'NotebookEdit', 'Bash(git -C:*)', 'Bash(git checkout:*)', 'Bash(git switch:*)', 'Bash(git pull:*)', 'Bash(git merge:*)', 'Bash(git rebase:*)',
+  'Bash(git stash:*)', 'Bash(git reset:*)', 'Bash(git restore:*)', 'Bash(git clean:*)', 'Bash(git commit:*)', 'Bash(git push:*)', 'Bash(git cherry-pick:*)', 'Bash(git revert:*)', 'Bash(git fetch:*)'];
 // 派活工具（MCP）。秘书会话起来时由 claude 拉起 `bridge.mjs mcp`，每次调用经 tasks.sock 转给转发程序。
 // confirm：派活、递话要用户点按钮；pending：带上「等用户拍板的事」清单的三个工具
 const taskTools = ({ confirm = true, pending = false } = {}) => [
@@ -498,7 +504,7 @@ async function run() {
       s.title = title || hint || id.slice(0, 8);
       s.root = await post(header(s));
       state.roots[s.root] = id;
-    } else if (title && title !== s.title && !s.task) { // 派出去的任务用秘书起的标题，不跟着改
+    } else if (title && title !== s.title && !s.task && !s.routine) { // 派出去的任务、例行任务用起好的标题，不跟着改
       s.title = title;
       await client.im.v1.message.patch({ path: { message_id: s.root }, data: { content: card(header(s)) } }).catch(() => {});
     }
@@ -587,6 +593,8 @@ async function run() {
       for (const f of files) await sendFile(resolvePath(f, s.cwd), root, s.dm).catch((e) => post(`📎 \`${f}\` 没发出去：${e.message}`, root, s.dm));
       if (s.dm && state.dm?.session === ev.session_id) state.dm.last = Date.now(); // 空闲从回完这一轮算起
       s.posted = [...s.posted, ...texts.map((t) => t.uuid)].slice(-300);
+      // 例行任务：最终结果完整发到私聊（发不出去会隔一会儿重试，不卡后面的事件）
+      if (s.routine) routineResult(ev.session_id, records, ev.at).catch((e) => log('routine result failed', e.message));
       // 秘书派的活、递的话做完一轮：私聊收一条短通知，结论取回复里的「汇报：」那一行
       const report = md.match(/^[\s*>#-]*汇报\**\s*[:：]\s*(.+)$/m)?.[1]?.replace(/\*+$/, '').trim();
       // 一轮结束不等于活干完了：出了方案等你拍板也是一轮结束。汇报里在等你的，标成「等你回复」
@@ -661,9 +669,10 @@ async function run() {
     s.pending.push(text);
     // 秘书不导入桌面：桌面版接着聊时没有派活工具，私聊消息还会被送到桌面那边去。
     // 派出去的任务和手机开的会话一样，第一轮做完就导入（每做完一个桌面窗口会切过去一次）
-    if (!resume && cfg.desktop_import !== false && !s.secretary) s.to_desktop = true;
+    // 例行任务也不自动导入：没人看着时窗口不该自己切走（私聊结果上有「在桌面打开」）
+    if (!resume && cfg.desktop_import !== false && !s.secretary && !s.routine) s.to_desktop = true;
     const mode = modeOf(s), model = modelOf(s);
-    const role = s.secretary ? secretaryNote(cfg.dispatch_confirm !== false) : s.task ? WORKER_NOTE : '用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。';
+    const role = s.secretary ? secretaryNote(cfg.dispatch_confirm !== false) : s.routine ? ROUTINE_NOTE : s.task ? WORKER_NOTE : '用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。';
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id, '--replay-user-messages',
       '--append-system-prompt', `${role}\n${PLAN_NOTE}${FILE_NOTE}`];
@@ -674,6 +683,10 @@ async function run() {
       const flags = ['--pending', ...(cfg.dispatch_confirm === false ? ['--direct'] : [])];
       args.push('--mcp-config', JSON.stringify({ mcpServers: { feishu: { type: 'stdio', command: process.execPath, args: [SELF, 'mcp', ...flags] } } }),
         '--allowedTools', taskTools({ pending: true }).map((t) => `mcp__feishu__${t.name}`).join(','));
+    }
+    if (s.routine) {
+      args.push('--disallowedTools', [...ROUTINE_DENY, ...(s.routine.deny ?? [])].join(','));
+      if (s.routine.allow?.length) args.push('--allowedTools', s.routine.allow.join(','));
     }
     const dir = (s.home ??= firstCwd(s.transcript) ?? s.cwd ?? cfg.workdir);
     const child = spawn(cfg.claude, args, { cwd: dir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
@@ -735,6 +748,7 @@ async function run() {
       finishStatus(id, stopped ? '⏹ 已停止' : code || failed ? '⚠️ 出错了' : '✅ 完成');
       if ((code || failed) && !stopped) post(`⚠️ 命令行会话出错（退出码 ${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
       if (s.task && (stopped || code || failed)) s.task.result = stopped ? 'stopped' : 'error';
+      if (s.routine) routineClosed(id, stopped, code || failed ? err : null);
       if ((code || failed) && !stopped && s.notify) notifyDone(id, '⚠️', '出错了', `${clip(err.trim().split('\n').filter(Boolean).at(-1) ?? '', 200)}（详情在话题里）`);
       save();
       const queued = running.get(id);
@@ -753,7 +767,7 @@ async function run() {
     save();
     await drain(); // 拿到钩子报上来的对话文件路径
     if (!s.transcript || !fs.existsSync(s.transcript)) return log('desktop import skipped: no transcript', id.slice(0, 8));
-    fs.appendFileSync(s.transcript, JSON.stringify({ type: 'custom-title', customTitle: `${s.task ? '📋' : '📱'} ${s.title}`, sessionId: id }) + '\n');
+    fs.appendFileSync(s.transcript, JSON.stringify({ type: 'custom-title', customTitle: `${s.routine ? '⏰' : s.task ? '📋' : '📱'} ${s.title}`, sessionId: id }) + '\n');
     await new Promise((resolve) =>
       spawn('/usr/bin/open', ['-g', `claude://resume?session=${id}`], { stdio: 'ignore' }).on('close', resolve).on('error', resolve));
     log('desktop import', id.slice(0, 8));
@@ -991,6 +1005,10 @@ async function run() {
     const input = req.input ?? {};
     if (!key) return { behavior: 'deny', message: '转发程序找不到这个会话对应的飞书会话，没法确认。' };
     if (s.stopped) return { behavior: 'deny', message: '没有执行：你在手机上点了停止' };
+    // 例行任务没人看着：要确认的一律不做、选择题不答，免得卡在那里等
+    if (s.routine) return log('routine deny', id.slice(0, 8), req.tool_name), { behavior: 'deny', message: req.tool_name === 'AskUserQuestion'
+      ? '例行任务没有人回答问题。按最稳妥的理解直接做完，拿不准的在结果里写明。'
+      : '例行任务没有人看着，要确认的操作一律不做。换只读的办法，或者跳过这一步并在结果里写明哪项没查成。' };
     if (takeAsked(id, req.tool_name, input)) return log('grant used', id.slice(0, 8)), { behavior: 'allow', updatedInput: input };
     const mirror = mirrorOf(s);
     if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id, mirror }));
@@ -1118,7 +1136,7 @@ async function run() {
   async function onDenied(req, gone) {
     await drain(); // 先把钩子事件读完，才知道这一轮是不是手机发起的
     const s = state.sessions[req.session_id];
-    if (!s?.phone || s.stopped) return null;
+    if (!s?.phone || s.stopped || s.routine) return null; // 例行任务没人看着，拦下就拦下了，不发卡片
     const key = s.dm ?? s.root;
     if (!key) return null;
     log('denied', req.session_id.slice(0, 8), req.tool_name, String(req.reason ?? '').slice(0, 60));
@@ -1328,7 +1346,7 @@ async function run() {
   function findTask(ref, desk = false) {
     const r = String(ref ?? '').trim().replace(/^\[|\]$/g, '');
     if (r.length < 4) return null;
-    const hits = Object.entries(state.sessions).filter(([id, s]) => (s.task || (desk && liveDesk(id, s))) && (id.startsWith(r) || s.title === r));
+    const hits = Object.entries(state.sessions).filter(([id, s]) => (s.task || s.routine || (desk && liveDesk(id, s))) && (id.startsWith(r) || s.title === r));
     return hits.length === 1 ? hits[0] : null;
   }
   const notFound = (ref) => ({ error: `找不到「${ref}」，先用 list_tasks 看编号` });
@@ -1349,8 +1367,12 @@ async function run() {
     const asks = Object.values(state.asks ?? {}).filter((d) => Date.now() - (d.at ?? 0) < 86400e3).map((d) => (d.kind === 'send' ? `- 给「${d.title}」追加指示 · 等你点「发送」` : `- 「${d.title}」 · 等你点「派」`));
     const desk = Object.entries(state.sessions).filter(([id, s]) => liveDesk(id, s))
       .map(([id, s]) => `- [${id.slice(0, 8)}] ${titleOfSession(s)} · ${s.desktop ? '桌面' : '终端'} · ${tilde(s.cwd ?? '')}`);
+    const rts = Object.entries(state.sessions).filter(([, s]) => s.routine && Date.now() - s.routine.started < 86400e3)
+      .sort((a, b) => b[1].routine.started - a[1].routine.started).slice(0, 10)
+      .map(([id, s]) => `- [${id.slice(0, 8)}] ${s.title} · ${routineState(id, s)} · ${when(s.routine.started)}${s.routine.line ? `\n  结果：${clip(s.routine.line, 200)}` : ''}`);
     return [
       `派出去的任务（最近 7 天${maxTasks() ? `；同时最多 ${maxTasks()} 个在跑` : ''}）：`, ...(mine.length ? mine : ['（没有）']),
+      ...(rts.length ? ['', '例行任务（转发程序自己开的，最近 24 小时；结果已完整发到私聊，task_detail 看全文）：', ...rts] : []),
       ...(asks.length ? ['', '等你确认的：', ...asks] : []),
       ...(desk.length ? ['', '电脑上开着的会话：', ...desk] : []),
     ].join('\n');
@@ -1575,6 +1597,7 @@ async function run() {
     const texts = turnTexts(readTail(s.transcript, 2 << 20), []).map((t) => t.text).join('\n\n');
     const head = s.task
       ? `「${s.title}」· ${taskState(id, s)} · ${when(s.task.started)} 派 · 目录 ${tilde(s.home ?? s.cwd ?? '')}\n\n派活说明：\n${clip(s.task.brief, 1500)}`
+      : s.routine ? `「${s.title}」· 例行任务 · ${routineState(id, s)} · ${when(s.routine.started)} 开始 · 目录 ${tilde(s.home ?? s.cwd ?? '')}`
       : `「${titleOfSession(s)}」· ${s.desktop ? '桌面' : '终端'}会话 · ${tilde(s.cwd ?? '')}`;
     const st = status.get(id);
     return { text: `${head}${st ? `\n\n现在：\n${statusMd(id, st)}` : ''}\n\n最近一轮的回复：\n${texts ? clip(texts, 6000) : '（还没有）'}` };
@@ -2117,16 +2140,17 @@ async function run() {
     return { ended, error, text: out.join('\n').trim() };
   }
   // 显示名在桌面版的 scheduled-tasks.json 里（只读）
-  function schedName(id) {
+  function schedFind(id) {
     const base = path.join(os.homedir(), 'Library/Application Support/Claude/claude-code-sessions');
     try {
       for (const a of fs.readdirSync(base)) for (const b of fs.readdirSync(path.join(base, a))) {
         const t = readJSON(path.join(base, a, b, 'scheduled-tasks.json'), {}).scheduledTasks?.find((x) => x.id === id);
-        if (t?.displayName) return t.displayName;
+        if (t) return t;
       }
     } catch {}
-    return id;
+    return null;
   }
+  const schedName = (id) => schedFind(id)?.displayName || id;
   const isNormal = (line) => /^[\s*_#>]*正常[\s*_。.!！]*$/.test(line);
   async function checkScheduled(sid, file, head, quiet) {
     const r = schedResult(readTail(file));
@@ -2185,6 +2209,290 @@ async function run() {
   }
   setInterval(scanScheduled, 30e3);
   setTimeout(scanScheduled, 3e3);
+  // 最近 within 毫秒内跑过、桌面版里还在的定时任务，每个任务取最近一次：{ name(显示名), start, ended, error, text(最终回复) }。早报引用它们的结论
+  function recentScheduled(within) {
+    const now = Date.now(), latest = new Map();
+    let dirs = [];
+    try { dirs = fs.readdirSync(PROJECTS); } catch {}
+    for (const d of dirs) {
+      let names = [];
+      try { names = fs.readdirSync(path.join(PROJECTS, d)); } catch {}
+      for (const n of names) {
+        if (!n.endsWith('.jsonl')) continue;
+        const file = path.join(PROJECTS, d, n);
+        try { if (now - fs.statSync(file).mtimeMs > within) continue; } catch { continue; }
+        if (!schedHeads.has(file)) {
+          const h = schedHead(file);
+          if (h === undefined) continue;
+          schedHeads.set(file, h);
+        }
+        const head = schedHeads.get(file);
+        if (!head || now - head.start > within || (latest.get(head.name)?.start ?? 0) > head.start) continue;
+        latest.set(head.name, { ...head, file });
+      }
+    }
+    return [...latest.values()].filter((h) => schedFind(h.name)).map((h) => ({ ...schedResult(readTail(h.file)), id: h.name, name: schedName(h.name), start: h.start }));
+  }
+
+  // ───── 例行任务 ─────
+  // 配置 routines：[{ name, enabled, at: '08:00', tz, prompt | prompt_file, cwd, fetch, context, max_minutes, model, mode, allowed_tools, disallowed_tools }]，
+  // 或把 at 换成 watch: { repo, remote, branch, ignore_authors, every_minutes, settle_minutes }（远端分支有别人推了新提交就跑）。
+  // 到点或触发时不用确认，直接在群里开一个话题、起一个命令行会话去跑（只读，见 ROUTINE_NOTE / ROUTINE_DENY）；
+  // 最后一条回复完整发到私聊（有「【私聊】」一行时只发它后面的），没跑成、超时、没输出也发一条。
+  // 每个例行任务的进度记在 state.routines[name]：day 哪天跑过（at），head 审到哪个提交（watch）
+  const routineList = () => (Array.isArray(cfg.routines) ? cfg.routines.filter((r) => r?.name && r.enabled !== false && (r.at || r.watch?.repo)) : []);
+  const routineTimers = new Map(); // 会话 id -> 超时停止的定时器
+  const routineBusy = (name) => Object.entries(state.sessions).some(([id, s]) => s.routine?.name === name && running.has(id));
+  function routineState(id, s) {
+    if (running.has(id)) return '进行中';
+    return { done: '已发私聊', error: '没跑成' }[s.routine.result] ?? '没在跑';
+  }
+  const expand = (p) => String(p).replace(/^~(?=$|\/)/, os.homedir());
+  // 某时区里的日期和当天第几分钟（早报按北京时间 8 点，不跟着电脑时区走）
+  function zoned(t, tz) {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: tz || undefined, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', weekday: 'short', hourCycle: 'h23' })
+      .formatToParts(t).map((x) => [x.type, x.value]));
+    return { day: `${p.year}-${p.month}-${p.day}`, mins: +p.hour * 60 + +p.minute, label: `${+p.month}-${+p.day} 周${'日一二三四五六'['SunMonTueWedThuFriSat'.indexOf(p.weekday) / 3]} ${p.hour}:${p.minute}` };
+  }
+  // 只读的 git：异步跑，带超时；fetch 不写 FETCH_HEAD（别的会话 pull 时会用它），不弹密码框
+  function git(repo, args, ms = 30e3) {
+    return new Promise((resolve, reject) => execFile('git', ['-C', repo, ...args], {
+      timeout: ms, maxBuffer: 16 << 20, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes' },
+    }, (e, out, err) => (e ? reject(new Error((String(err).trim().split('\n').at(-1) || e.message).slice(0, 300))) : resolve(String(out).trim()))));
+  }
+  const gitFetch = (repo, remote = 'origin') => git(repo, ['fetch', '--quiet', '--no-write-fetch-head', remote], 120e3);
+
+  // 转发程序替例行任务备好的材料：桌面版巡检的最近结论、过去 24 小时派出去的任务
+  function scheduledBlock() {
+    const runs = recentScheduled(36 * 3600e3).sort((a, b) => b.start - a.start);
+    if (!runs.length) return '桌面版定时巡检：最近 36 小时没找到运行记录（电脑睡着或桌面版没开时不会跑）。';
+    return ['桌面版定时巡检最近一次的结论（转发程序从对话记录里读的，「正常」= 全部正常）：', ...runs.map((r) => {
+      const lines = r.text.split('\n').map((l) => l.trim()).filter(Boolean);
+      const what = !r.ended ? '还没跑完或卡住了' : r.error ? `出错：${clip(lines.join(' '), 200)}` : !lines.length ? '跑完了但没有文字结论' : clip(lines.slice(0, 8).join('\n  '), 1200);
+      return `- ${r.name}（${when(r.start)} 开始）：${what}`;
+    })].join('\n');
+  }
+  function tasksBlock() {
+    const day = Date.now() - 86400e3;
+    const xs = tasks().filter(([, s]) => s.task.started > day || (s.last_end ?? 0) > day);
+    if (!xs.length) return '过去 24 小时秘书派出去的任务：没有。';
+    const groups = new Map();
+    for (const [id, s] of xs) {
+      const k = taskState(id, s);
+      const r = s.task.report ?? '';
+      (groups.get(k) ?? groups.set(k, []).get(k)).push(`「${s.title}」${['等你回复', '出错了'].includes(k) && r ? `（汇报：${r.length > 200 ? r.slice(0, 200) + '…' : r}）` : ''}`);
+    }
+    return ['过去 24 小时秘书派出去的任务（转发程序的记录，按现在的状态分组；「这一轮结束」= 做完了）：',
+      ...[...groups].map(([k, v]) => `- ${k} ${v.length}：${v.join('、')}`)].join('\n');
+  }
+  function commitsBlock(c) {
+    const line = (x) => `- ${x.sha.slice(0, 10)} ${x.author} ${x.date.slice(0, 16).replace('T', ' ')} ${x.subject}`;
+    return [
+      `要审的范围：${c.ref} ${c.base.slice(0, 10)}..${c.head.slice(0, 10)}（不含合并提交，共 ${c.commits.length} 个）。转发程序刚 fetch 过，直接用 git show <提交> / git diff ${c.base.slice(0, 10)} ${c.head.slice(0, 10)} 看。`,
+      `要审的（作者不是 ${c.ignore.join(' / ')}）：`, ...c.others.slice(0, 40).map(line), ...(c.others.length > 40 ? [`- …还有 ${c.others.length - 40} 个，用 git log 看`] : []),
+      ...(c.own.length ? [`${c.ignore.join(' / ')} 自己的（不用审，改动和上面交叉时参考）：`, ...c.own.slice(0, 20).map(line)] : []),
+    ].join('\n');
+  }
+
+  async function startRoutine(r, extra = {}) {
+    const cwd = expand(r.cwd ?? r.watch?.repo ?? cfg.workdir);
+    const bad = (msg) => Object.assign(new Error(msg), { config: true });
+    let prompt = r.prompt ?? '';
+    if (!prompt && r.prompt_file) try { prompt = fs.readFileSync(expand(r.prompt_file), 'utf8'); } catch (e) { throw bad(`提示词文件读不了：${e.message}`); }
+    if (!prompt.trim()) throw bad('没有提示词（配 prompt 或 prompt_file）');
+    if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw bad(`工作目录不存在：${cwd}`);
+    const now = zoned(Date.now(), r.tz);
+    prompt = prompt.replaceAll('{{date}}', now.label.split(' ').slice(0, 2).join(' ')); // 「11-20 周五」，示例里写死的日期模型会照抄
+    const blocks = [];
+    if (r.fetch) await gitFetch(expand(r.fetch)).catch((e) => blocks.push(`（转发程序跑 git fetch 没成功：${e.message}。远端分支可能不是最新的，结果里要说明）`));
+    if (extra.commits) blocks.push(commitsBlock(extra));
+    for (const c of r.context ?? []) blocks.push(c === 'scheduled' ? scheduledBlock() : c === 'tasks' ? tasksBlock() : '');
+    const text = [`【例行任务：${r.name}】现在是 ${now.label}${r.tz ? `（${r.tz}）` : ''}。`, prompt.trim(), ...blocks.filter(Boolean).map((b) => `---\n${b}`)].join('\n\n');
+    const title = extra.commits ? `${r.name} ${extra.others.map((x) => x.author).filter((a, i, xs) => xs.indexOf(a) === i).join('、')} ${extra.others.length} 个提交` : `${r.name} ${now.label.split(' ').slice(0, 2).join(' ')}`;
+    const id = crypto.randomUUID();
+    const root = await post(`⏰ **${title}**\n\`${tilde(cwd)}\` · 例行任务（只读，自动开始）`);
+    const { day, prev, base, head } = extra; // 重启打断时按这些重跑
+    Object.assign(session(id), { root, title, cwd, home: cwd,
+      routine: { name: r.name, started: Date.now(), max: (Number(r.max_minutes) || 30) * 60e3, allow: r.allowed_tools, deny: r.disallowed_tools, day, prev, base, head },
+      ...(r.model !== undefined && { model: parsePick('model', String(r.model)) ?? String(r.model) }), ...(r.mode && { mode: parsePick('mode', String(r.mode)) ?? String(r.mode) }) });
+    state.roots[root] = id;
+    save();
+    // 话题开出来了就一定要跑起来：后面贴提示词失败不算，免得下一轮又开一个
+    for (const part of chunks(text)) await post(part, root).catch((e) => log('routine prompt post failed', e.message));
+    runCli(id, text, false);
+    routineTimers.set(id, setTimeout(() => {
+      routineTimers.delete(id);
+      if (!running.has(id)) return;
+      session(id).routine.timeout = true;
+      stopTask(id);
+    }, session(id).routine.max));
+    log('routine start', r.name, id.slice(0, 8), extra.head ? extra.head.slice(0, 10) : '');
+    return id;
+  }
+
+  // 私聊发结果：最后一条回复（所有工具调用之后的文字）；有「【私聊】」一行时只发它后面的（前面的详细意见留在话题里）
+  async function routineResult(id, records, until) {
+    const s = session(id), rt = s.routine;
+    if (rt.sent || rt.sending || !dmChat()) return;
+    // Stop 钩子来了就是这一轮结束了，不再看 ended（摘要记录可能还没写进文件）
+    const res = schedResult(records.filter((r) => !until || !r.timestamp || Date.parse(r.timestamp) <= until));
+    const files = [];
+    let text = res.text;
+    const mark = text.lastIndexOf('【私聊】');
+    if (mark >= 0) text = text.slice(mark + 4).replace(/^[*:：\s]+/, '');
+    text = text.split('\n').filter((l) => !(l.match(FILE_MARK) && files.push(l.match(FILE_MARK)[1]))).join('\n').trim();
+    if (res.error || !text) return routineFailed(id, res.error ? `出错：${clip(text || res.text, 300)}` : '跑完了，但最后没有文字结果');
+    // 第一行已经像标题（带名字，或以表情、粗体开头）就不另加
+    const first = text.split('\n')[0];
+    const head = first.includes(rt.name) || /^\s*(\p{Extended_Pictographic}|\*\*)/u.test(first) ? '' : `⏰ **${rt.name}**\n`;
+    const parts = chunks(head + text);
+    await deliverRoutine(rt, async () => {
+      for (const p of parts.slice(0, -1)) await post(p, null, dmChat());
+      await postCard([{ tag: 'markdown', content: parts.at(-1) }, buttonRow([button('在桌面打开', { a: 'desk', sid: id })])], null, dmChat());
+    }, { result: 'done', line: text.split('\n').find((l) => l.trim())?.replace(/[*#>]/g, '').trim() });
+    for (const f of files) await sendFile(resolvePath(f, s.cwd), null, dmChat()).catch((e) => post(`📎 \`${f}\` 没发出去：${e.message}`, null, dmChat()));
+    log('routine result sent', rt.name, id.slice(0, 8));
+  }
+  async function routineFailed(id, why) {
+    const s = session(id), rt = s.routine;
+    if (rt.sent || rt.sending) return;
+    log('routine failed', rt.name, id.slice(0, 8), why.slice(0, 80));
+    if (!dmChat()) return Object.assign(rt, { sent: true, result: 'error', line: `没跑成：${why}` }), save();
+    await deliverRoutine(rt, () => postCard([{ tag: 'markdown', content: `⚠️ **${rt.name}** 没跑成：${why}\n过程在群里的话题「${s.title}」` }, buttonRow([button('在桌面打开', { a: 'desk', sid: id })])], null, dmChat()),
+      { result: 'error', line: `没跑成：${why}` }).catch((e) => log('routine notify failed', e.message));
+  }
+  // 往私聊发结果：发成功了才记 sent；失败（多半断网）隔 30 秒重试，共 4 次。发的过程中（sending）别处不再发
+  async function deliverRoutine(rt, send, done) {
+    rt.sending = true;
+    try {
+      for (let i = 0; ; i++) {
+        try { await send(); break; } catch (e) {
+          log('routine post failed', rt.name, i + 1, e.message);
+          if (i >= 3) throw e;
+          await sleep(30e3);
+        }
+      }
+      Object.assign(rt, { sent: true, ...done });
+    } finally {
+      delete rt.sending;
+      save();
+    }
+  }
+  // 进程退了：出错、超时、被停的报没跑成；正常退出的等 Stop 钩子那边发结果，几秒后还没发（没写结论）也报
+  function routineClosed(id, stopped, err) {
+    clearTimeout(routineTimers.get(id));
+    routineTimers.delete(id);
+    const rt = session(id).routine;
+    const why = rt.timeout ? `跑了 ${Math.round(rt.max / 60e3)} 分钟还没完，已停止` : stopped ? '被停止了' : err ? clip(err.trim().split('\n').filter(Boolean).at(-1) ?? '命令行出错', 300) : null;
+    setTimeout(async () => {
+      await drain().catch(() => {});
+      const s = session(id);
+      // 钩子没报上来（没收到 Stop）时自己读对话文件
+      if (rt.sent || rt.sending) return; // 结果已发、或正在发（重试中）
+      if (!why && s.transcript) await routineResult(id, readTail(s.transcript)).catch((e) => log('routine result failed', e.message));
+      if (!rt.sent && !rt.sending) routineFailed(id, why ?? '跑完了，但最后没有文字结果');
+    }, why ? 0 : 5000);
+  }
+  // 转发程序重启（部署、崩溃）会杀掉正在跑的例行任务：到点跑的今天重跑一次，审查的把没审完的范围放回去重审
+  function recoverRoutines() {
+    for (const [id, s] of Object.entries(state.sessions)) {
+      const rt = s.routine;
+      if (!rt || rt.sent || Date.now() - rt.started > 12 * 3600e3) continue;
+      delete rt.sending;
+      const st = state.routines?.[rt.name];
+      Object.assign(rt, { sent: true, result: 'error', line: '被转发程序重启打断，已重跑' });
+      if (st && rt.base && st.head === rt.head) st.head = rt.base;
+      else if (st && rt.day && st.day === rt.day) st.day = rt.prev ?? null;
+      log('routine interrupted, will rerun', rt.name, id.slice(0, 8));
+    }
+    save();
+  }
+
+  // develop 这类分支：定时 fetch，有作者不是自己的新提交就开一个审查会话。审到哪个提交记在 head（第一次启用时取当时的，不审历史）；
+  // 看到新提交后再等 settle_minutes 看还有没有接着推的，连着推的合成一次（最多等 30 分钟）；上一次审查还在跑就等它跑完
+  const SETTLE_MAX = 30 * 60e3;
+  async function watchTick(r, st) {
+    const w = r.watch, now = Date.now();
+    if (now < (st.next ?? 0)) return;
+    st.next = now + (Number(w.every_minutes) || 20) * 60e3;
+    const repo = expand(w.repo), ref = `${w.remote ?? 'origin'}/${w.branch ?? 'develop'}`;
+    let head;
+    try {
+      await gitFetch(repo, w.remote ?? 'origin');
+      head = await git(repo, ['rev-parse', '--verify', `${ref}^{commit}`]);
+      if (st.fail) delete st.fail;
+    } catch (e) {
+      st.fail = (st.fail ?? 0) + 1;
+      save();
+      log('routine fetch failed', r.name, st.fail, e.message);
+      if (st.fail === 3) post(`⚠️ **${r.name}**：git fetch 连续 3 次失败，先不审了，好了会自动接着审\n${e.message}`, null, dmChat()).catch(() => {});
+      return;
+    }
+    if (!st.head) return Object.assign(st, { head }), save(), log('routine baseline', r.name, head.slice(0, 10));
+    if (head === st.head) return st.pending && (delete st.pending, save());
+    if (st.pending?.head !== head) {
+      st.pending = { head, since: st.pending?.since ?? now };
+      if (now - st.pending.since < SETTLE_MAX) return (st.next = now + (Number(w.settle_minutes) || 5) * 60e3), save();
+    }
+    // 推过的分支被改写（force push）时，从分叉点算起
+    const base = await git(repo, ['merge-base', '--is-ancestor', st.head, head]).then(() => st.head, () => git(repo, ['merge-base', st.head, head]).catch(() => null));
+    const range = base ? `${base}..${head}` : `${head}~1..${head}`;
+    const commits = (await git(repo, ['log', '--no-merges', '--format=%H%x1f%an%x1f%ae%x1f%cI%x1f%s', range])).split('\n').filter(Boolean)
+      .map((l) => { const [sha, author, email, date, subject] = l.split('\x1f'); return { sha, author, email, date, subject }; });
+    const ignore = (w.ignore_authors ?? []).map((a) => String(a).toLowerCase());
+    const mine = (c) => ignore.some((a) => a === c.author.toLowerCase() || a === c.email.toLowerCase() || a === c.email.toLowerCase().split('@')[0]);
+    const others = commits.filter((c) => !mine(c)), own = commits.filter(mine);
+    delete st.pending;
+    if (others.length) {
+      // 开不出来（断网、配置错）就不往前挪，下一轮再试
+      await startRoutine(r, { ref, base: base ?? `${head}~1`, head, commits, others, own, ignore: w.ignore_authors ?? [] });
+    } else log('routine skip: no new commits from others', r.name, range);
+    st.head = head;
+    save();
+  }
+
+  let routineTicking = false;
+  async function tickRoutines() {
+    if (routineTicking || !dmChat()) return; // 还没人私聊过机器人：结果没地方发
+    routineTicking = true;
+    try {
+      for (const r of routineList()) {
+        const st = ((state.routines ??= {})[r.name] ??= {});
+        if (routineBusy(r.name)) continue;
+        try {
+          if (r.watch?.repo) { await watchTick(r, st); continue; }
+          const [h, m] = String(r.at).split(':').map(Number), due = h * 60 + (m || 0);
+          const { day, mins } = zoned(Date.now(), r.tz);
+          // 第一次启用时今天已经过了点：从明天开始，不补今天的
+          if (!('day' in st)) Object.assign(st, { day: mins >= due ? day : null }), save();
+          if (st.day === day || mins < due) continue;
+          const prev = st.day;
+          st.day = day; // 先记上：跑起来以后出什么错都只报一次，不会一天跑好几遍
+          save();
+          // 电脑睡着、转发程序没开错过了点：catchup_hours（默认 6）小时内补跑，再晚就不跑了
+          if (mins - due > (Number(r.catchup_hours) || 6) * 60) { log('routine skipped: too late', r.name, day); continue; }
+          await startRoutine(r, { day, prev }).catch((e) => {
+            if (!e.config) st.day = prev; // 话题都没开出来（多半是断网）：下一轮再试；配置错的今天不再试
+            save();
+            throw e;
+          });
+        } catch (e) {
+          log('routine failed', r.name, e.message);
+          // 配置错（提示词文件、目录不对）私聊说一次，同样的错不重复说
+          if (e.config && st.config_error !== e.message) {
+            st.config_error = e.message;
+            save();
+            post(`⚠️ 例行任务「${r.name}」没法开始：${e.message}\n改好 config.json 里的 routines 后重启转发程序`, null, dmChat()).catch(() => {});
+          }
+          continue;
+        }
+        if (st.config_error) delete st.config_error, save();
+      }
+    } finally { routineTicking = false; }
+  }
+  recoverRoutines();
+  setInterval(() => tickRoutines(), 30e3);
+  setTimeout(() => tickRoutines(), 10e3);
 
   // ───── 补收 ─────
   // 长连接断了又连上的那段时间里，飞书推过来的消息会丢，事后也不重推（11-19 10:34 丢过一条话题回复）。
