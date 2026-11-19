@@ -425,10 +425,12 @@ async function run() {
     if (ev.desktop) s.desktop = true;
     if (ev.socket && ev.token) Object.assign(s, { socket: ev.socket, token: ev.token });
     if (ev.event === 'SessionEnd') {
-      Object.assign(s, { socket: undefined, token: undefined });
+      Object.assign(s, { socket: undefined, token: undefined, busy_since: undefined });
       finishStatus(ev.session_id, s.stopped ? '⏹ 已停止' : '⏹ 会话已结束');
     }
 
+    if (ev.event === 'UserPromptSubmit' && ev.prompt) s.busy_since ??= ev.at ?? Date.now(); // 大屏：这一轮从什么时候开始
+    if (ev.event === 'Stop') Object.assign(s, { busy_since: undefined, last_end: ev.at ?? Date.now() });
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
       const i = s.pending.findIndex((t) => ev.prompt.includes(t));
       // 手机上插话进正在跑的那一轮：同一轮接着用原来的「工作中」卡片，不另起
@@ -551,6 +553,7 @@ async function run() {
       '--allowedTools', TASK_TOOLS.map((t) => `mcp__feishu__${t.name}`).join(','));
     const dir = (s.home ??= firstCwd(s.transcript) ?? s.cwd ?? cfg.workdir);
     const child = spawn(cfg.claude, args, { cwd: dir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+    s.busy_since ??= Date.now(); // 大屏：钩子没来得及报时也知道从什么时候开始跑
     log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', dir);
     const send = (o) => child.stdin.writable && child.stdin.write(JSON.stringify(o) + '\n');
     child.stdin.on('error', () => {});
@@ -601,6 +604,7 @@ async function run() {
     child.on('close', (code) => { // 进程没能起来（error）时也会触发 close
       log('cli exit', id.slice(0, 8), code);
       procs.delete(id);
+      Object.assign(s, { busy_since: undefined, last_end: Date.now() });
       delete s.midturn;
       const stopped = s.stopped; // 手机上点了停止：被打断的那一轮不算出错
       delete s.stopped;
@@ -1148,6 +1152,86 @@ async function run() {
     ].join('\n');
   }
 
+  // ───── 大屏 ─────
+  // 私聊发 /大屏（或 /board）：一张汇总卡片，等你的放最上面，然后是正在跑的、最近结束的。
+  // 每 30 秒刷新一次（内容变了才改），两小时后停；再发一次 /大屏 换成新的一张，旧的那张不再刷新
+  const BOARD_LIFE = 2 * 3600e3, BOARD_RECENT = 12 * 3600e3;
+  const span = (ms) => (ms < 60e3 ? '不到 1 分钟' : ms < 3600e3 ? `${Math.floor(ms / 60e3)} 分钟`
+    : `${Math.floor(ms / 3600e3)} 小时${Math.floor((ms % 3600e3) / 60e3) ? ` ${Math.floor((ms % 3600e3) / 60e3)} 分` : ''}`);
+  // 正在做的那一步：有计划显示计划进度，没有就显示最近一次工具调用
+  function nowDoing(id, s) {
+    const records = readTail(s.transcript, 512 << 10).filter((r) => !r.isSidechain);
+    const since = s.busy_since ?? 0;
+    const start = records.findLastIndex((r) => r.timestamp && Date.parse(r.timestamp) < since);
+    const items = cliPlan(id, since) ?? desktopPlan(records, start);
+    if (items?.length) {
+      const done = items.filter((t) => t.status === 'completed').length;
+      const cur = items.find((t) => t.status === 'in_progress') ?? items.find((t) => t.status !== 'completed');
+      return `计划 ${done}/${items.length}${cur ? ` · ▶️ ${cur.text.replace(/\s+/g, ' ').slice(0, 40)}` : ''}`;
+    }
+    const last = records.slice(start + 1).flatMap((r) => (r.type === 'assistant' && Array.isArray(r.message?.content) ? r.message.content.filter((b) => b?.type === 'tool_use' && !PLAN_TOOLS.test(b.name)) : [])).at(-1);
+    return last ? `最近：${toolLine(last).slice(0, 60)}` : '正在想…';
+  }
+  function boardMd() {
+    const now = Date.now();
+    const mtime = (f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
+    const rows = { ask: [], wait: [], run: [], end: [] };
+    for (const [id, s] of Object.entries(state.sessions)) {
+      if (s.secretary) continue;
+      const key = s.dm ?? s.root;
+      const live = s.socket && alive(s.socket);
+      const busy = running.has(id) || (s.busy_since && live);
+      const last = Math.max(s.task?.started ?? 0, s.busy_since ?? 0, s.last_end ?? 0, mtime(s.transcript));
+      if (!busy && !(key && waiting.has(key)) && now - last > BOARD_RECENT) continue;
+      const title = `**${titleOfSession(s).replace(/\*/g, '').slice(0, 30)}**`;
+      const kind = s.task ? '派' : s.desktop ? '桌面' : s.dm ? '私聊' : '话题';
+      const report = s.task?.report ? `\n　汇报：${s.task.report.slice(0, 80)}` : '';
+      if (key && waiting.has(key)) rows.ask.push([last, `- ${title} · ${kind} · 有审批或选择题等你点（在${s.dm ? '私聊' : '话题'}里）`]);
+      else if (busy) {
+        const from = s.busy_since ?? status.get(id)?.start;
+        rows.run.push([from ?? last, `- ${title} · ${kind}${from ? ` · 已跑 ${span(Date.now() - from)}` : ''}\n　${nowDoing(id, s)}`]);
+      }
+      else if (s.task?.result === 'waiting') rows.wait.push([last, `- ${title} · ${kind} · ${span(Date.now() - (s.last_end ?? last))}前停下${report}`]);
+      else {
+        const how = { error: '⚠️ 出错了', stopped: '⏹ 已停止' }[s.task?.result] ?? '这一轮结束';
+        rows.end.push([last, `- ${title} · ${kind} · ${how} · ${when(s.last_end ?? last)}${report}`]);
+      }
+    }
+    const sec = (head, list, max) => (list.length ? [`**${head}（${list.length}）**`, ...list.sort((a, b) => b[0] - a[0]).slice(0, max).map((x) => x[1]), ...(list.length > max ? [`…还有 ${list.length - max} 个`] : [])].join('\n') : '');
+    const parts = [
+      sec('🔴 等你点', rows.ask, 20),
+      sec('🟡 等你回复', rows.wait, 20),
+      sec('🟢 进行中', rows.run, 20),
+      sec('⚪ 最近结束', rows.end, 8),
+    ].filter(Boolean);
+    const head = `**📊 任务大屏** · 等你 ${rows.ask.length + rows.wait.length} · 进行中 ${rows.run.length}`;
+    return [head, ...(parts.length ? parts : ['最近 12 小时没有任务。'])].join('\n\n');
+  }
+  const boardCard = (md, until) => [
+    { tag: 'markdown', content: `${md}\n\n<font color='grey'>${when(Date.now())} 更新${until > Date.now() ? ' · 每 30 秒自动刷新' : ' · 已停止自动刷新，点刷新或再发 /大屏'}</font>` },
+    buttonRow([button('刷新', { a: 'board' })]),
+  ];
+  let boardShown = '';
+  async function refreshBoard(force) {
+    const b = state.board;
+    if (!b?.msg || (!force && Date.now() > b.until)) return;
+    const md = boardMd();
+    if (!force && md === boardShown) return;
+    boardShown = md;
+    await patchCard(b.msg, boardCard(md, b.until));
+  }
+  async function postBoard(chat) {
+    const md = boardMd();
+    boardShown = md;
+    const until = Date.now() + BOARD_LIFE;
+    const old = state.board;
+    state.board = { msg: await postCard(boardCard(md, until), null, chat), until };
+    save();
+    // 旧的那张标上不再刷新
+    if (old?.msg && old.until > Date.now()) patchCard(old.msg, [{ tag: 'markdown', content: '（这张大屏已不再刷新，看最新的那张）' }]).catch(() => {});
+  }
+  setInterval(() => refreshBoard().catch((e) => log('board refresh failed', e.message)), 30e3);
+
   // 秘书一直用同一个会话，每条消息都要把整段历史重读一遍，越聊越贵。隔了天（早上 4 点算新一天），
   // 或上下文超过 secretary_max_context（默认 8 万 token，0 = 不按大小换）就换一个新秘书，
   // 交接不靠模型总结：转发程序把任务清单和最近几句对话塞进新秘书的第一条消息
@@ -1558,6 +1642,7 @@ async function run() {
       ? '这里是你的秘书：一个一直开着的 Claude 会话。小事它自己做，大活它派到群里单独的话题里做（要你点「派」才开始），做完、出错、等你确认时这里会收到通知。'
       : '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
     ...(secretaryOn() ? ['`/tasks` 看派出去的任务和电脑上开着的会话'] : []),
+    '`/大屏` 一张自动刷新的任务汇总：等你的、正在跑的、最近结束的',
     `\`/new [内容]\` ${secretaryOn() ? '换一个新的秘书会话（派出去的任务不受影响）' : '结束当前任务，开新任务'}`,
     `\`/cd <别名或绝对路径> [内容]\` 在指定目录开新${secretaryOn() ? '的秘书会话' : '任务'}`,
     '`/stop` 停止正在跑的那一轮（也可以点「工作中」卡片上的停止）',
@@ -1590,10 +1675,13 @@ async function run() {
     dm.chat_id = m.chat_id;
     const say = (md) => post(md, null, m.chat_id);
     if (!text) return say('暂时只支持文字、图片和文件。');
-    const [, cmd, arg = ''] = text.match(/^\/(new|cd|help|tasks)(?:\s+([\s\S]*))?$/i) ?? [];
+    const [, cmd, arg = ''] = text.match(/^\/(new|cd|help|tasks|board|大屏)(?:\s+([\s\S]*))?$/i) ?? [];
     switch (cmd?.toLowerCase()) {
       case 'tasks':
         return say(listTasks());
+      case 'board':
+      case '大屏':
+        return postBoard(m.chat_id).catch((e) => say(`大屏没发出来：${e.message}`));
       case 'help': // 「/help 你是谁」：先回说明，后面的内容照常当一条消息处理
         await say(DM_HELP());
         if (!arg.trim()) return;
@@ -1834,6 +1922,13 @@ async function run() {
         return { toast: { type: 'success', content: '正在停止' }, ...(st && { card: { type: 'raw', data: JSON.parse(cardOf(statusCard(v.sid, st))) } }) };
       }
       if (/^(no)?(dispatch|send)$/.test(v.a)) return answerAsk(v); // 秘书派活、递话的确认
+      if (v.a === 'board') { // 大屏上的「刷新」：直接换成最新内容，顺便再续两小时自动刷新
+        const msg = data.context?.open_message_id;
+        if (state.board?.msg === msg) state.board.until = Date.now() + BOARD_LIFE, save();
+        const md = boardMd();
+        if (state.board?.msg === msg) boardShown = md;
+        return { toast: { type: 'success', content: '已刷新' }, card: { type: 'raw', data: JSON.parse(cardOf(boardCard(md, state.board?.msg === msg ? state.board.until : 0))) } };
+      }
       if (v.a === 'open') { // 定时任务提醒上的「在桌面打开」：会话本来就是桌面版的，直接跳过去，不像 desk 那样导入改标题
         if (!/^[0-9a-f-]{36}$/.test(v.sid ?? '')) return { toast: { type: 'info', content: '找不到这个会话' } };
         spawn('/usr/bin/open', ['-g', `claude://resume?session=${v.sid}`], { stdio: 'ignore' }).on('error', () => {});
