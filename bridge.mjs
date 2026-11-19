@@ -952,7 +952,7 @@ async function run() {
     const input = req.input ?? {};
     if (!key) return { behavior: 'deny', message: '转发程序找不到这个会话对应的飞书会话，没法确认。' };
     if (s.stopped) return { behavior: 'deny', message: '没有执行：你在手机上点了停止' };
-    if (takeGrant(id, req.tool_name, input, 'asked')) return log('grant used', id.slice(0, 8)), { behavior: 'allow', updatedInput: input };
+    if (takeAsked(id, req.tool_name, input)) return log('grant used', id.slice(0, 8)), { behavior: 'allow', updatedInput: input };
     const mirror = mirrorOf(s);
     if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id, mirror }));
     if (isImageRead(req.tool_name, input)) return { behavior: 'allow', updatedInput: input };
@@ -1003,19 +1003,18 @@ async function run() {
     const s = state.sessions[req.session_id];
     if (!s?.phone) return null;
     if (running.has(req.session_id)) return null; // 转发程序自己起的：不在这里答，CLI 会接着经 stdio 问到 answerTool
-    if (takeGrant(req.session_id, req.tool_name, req.tool_input, 'asked')) return log('grant used', req.session_id.slice(0, 8)), { behavior: 'allow' };
+    if (takeAsked(req.session_id, req.tool_name, req.tool_input)) return log('grant used', req.session_id.slice(0, 8)), { behavior: 'allow' };
     const key = s.dm ?? s.root;
     if (!key) return null;
-    if (req.tool_name === 'AskUserQuestion') { // 钩子答不了选择题，只能在桌面上点
-      post(`${questionSpec(req.tool_input ?? {}).body}\n\n这道题要在桌面版里选，手机上答不了。`, s.dm ? null : s.root, s.dm).catch(() => {});
-      return null;
-    }
     if (isImageRead(req.tool_name, req.tool_input)) return { behavior: 'allow' };
     const ctl = new AbortController();
     gone.addEventListener('abort', () => ctl.abort('会话那边已经不等了'));
     const stop = watchAnswered(s, req, ctl);
+    // 选择题：卡片上点选项，钩子把答案带回去（decision.updatedInput.answers）；电脑上先答了、或到点，手机这边不表态
+    const q = req.tool_name === 'AskUserQuestion' && questionSpec(req.tool_input ?? {});
+    const spec = q ? { ...q, hint: (mins) => `${q.hint(mins)}电脑上也在问，哪边先答算哪边。`, onTimeout: () => null, onAbort: () => null } : approvalSpec(req, true, lastSaid(s));
     try {
-      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...approvalSpec(req, true, lastSaid(s)), signal: ctl.signal, mirror: mirrorOf(s) }));
+      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...spec, signal: ctl.signal, mirror: mirrorOf(s) }));
     } finally { stop(); }
   }
 
@@ -1025,28 +1024,51 @@ async function run() {
   // 确认请求（桌面经 PermissionRequest 钩子到 decide，转发程序起的经 stdio 到 answerTool）按你点的允许。
   // 只放那一条：同一个会话、同一个工具、同样的命令（其他工具比参数，不看 description），用一次，10 分钟内。
   // 你在电脑上发起的轮次不发卡片，电脑上本来就有提示
-  const grants = []; // { sid, tool, key, until, stage: 'granted'（等重试）| 'asked'（等确认） }
-  const grantKey = (tool, input = {}) => (tool === 'Bash' ? String(input.command ?? '').trim()
+  const grants = []; // 你点过「允许这一次」的：{ sid, tool, parts（Bash：命令拆开的各段）| key（其他工具：参数）, until }
+  const asked = []; // 在放行范围内、已改成要确认、正等确认的那一次调用：{ sid, tool, key, until }
+  // 粗拆 shell 命令：按 &&、||、;、|、换行分段，去掉 2>&1、>/dev/null 这类重定向
+  const shellParts = (cmd) => String(cmd ?? '').split(/&&|\|\||;|\||\n/)
+    .map((p) => p.replace(/\s*\d?>&\d/g, ' ').replace(/\s*\d?>\s*\/dev\/null/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const callKey = (tool, input = {}) => (tool === 'Bash' ? String(input.command ?? '').trim()
     : canon(Object.fromEntries(Object.entries(input).filter(([k]) => k !== 'description'))));
+  // Claude 重试时常把一长串命令拆开跑、末尾加 | tail（11-19 推送就是这样没对上）：这次的每一段要么在你放行的
+  // 那条里，要么是只过滤输出的 tail、head、grep 这类（不带重定向）；至少有一段是放行过的
+  const FILTER = /^(tail|head|grep|egrep|wc|cat|sort|uniq|cut)( [^<>]*)?$/;
+  const covers = (g, tool, input) => g.tool === tool && (tool === 'Bash'
+    ? ((p) => p.some((x) => g.parts.includes(x)) && p.every((x) => g.parts.includes(x) || FILTER.test(x)))(shellParts(input?.command))
+    : g.key === callKey(tool, input));
   function syncGrants() { // grants.json 在不在决定 PreToolUse 钩子要不要起 node
-    for (let i = grants.length - 1; i >= 0; i--) if (grants[i].until < Date.now()) grants.splice(i, 1);
-    if (grants.length) fs.writeFileSync(GRANTS, String(grants.length), { mode: 0o600 });
+    const now = Date.now();
+    for (const list of [grants, asked]) for (let i = list.length - 1; i >= 0; i--) if (list[i].until < now) list.splice(i, 1);
+    if (grants.length || asked.length) fs.writeFileSync(GRANTS, String(grants.length + asked.length), { mode: 0o600 });
     else fs.rmSync(GRANTS, { force: true });
   }
-  syncGrants(); // 上次没用掉的放行不留（只在内存里），文件也清掉
-  function takeGrant(sid, tool, input, stage, next) {
+  syncGrants(); // 上次没用完的放行不留（只在内存里），文件也清掉
+  function addGrant(sid, tool, input) {
+    grants.push({ sid, tool, until: Date.now() + 10 * 60e3, ...(tool === 'Bash' ? { parts: shellParts(input?.command) } : { key: callKey(tool, input) }) });
     syncGrants();
-    const key = grantKey(tool, input);
-    const g = grants.find((x) => x.sid === sid && x.tool === tool && x.key === key && x.stage === stage);
-    if (!g) return false;
-    if (next) Object.assign(g, { stage: next, until: Math.min(g.until, Date.now() + 120e3) });
-    else grants.splice(grants.indexOf(g), 1);
+  }
+  // PreToolUse：这次调用在放行范围内 → 记下这一次，改成要确认
+  function preTool(sid, tool, input) {
+    syncGrants();
+    if (!grants.some((g) => g.sid === sid && covers(g, tool, input))) return false;
+    asked.push({ sid, tool, key: callKey(tool, input), until: Date.now() + 120e3 });
+    syncGrants();
+    return true;
+  }
+  // 确认请求：是刚改成要确认的那一次 → 允许（用掉这一次的记录；放行本身 10 分钟内还在）
+  function takeAsked(sid, tool, input) {
+    syncGrants();
+    const key = callKey(tool, input);
+    const i = asked.findIndex((a) => a.sid === sid && a.tool === tool && a.key === key);
+    if (i < 0) return false;
+    asked.splice(i, 1);
     syncGrants();
     return true;
   }
   const deniedSpec = (req) => ({
     body: `🚫 **自动模式拦下了：${req.tool_name}**\n原因：${clip(String(req.reason || '没说'), 300)}\n${describe(req).replace(/^🔐 \*\*需要确认：[^\n]*\n/, '')}`,
-    hint: (mins) => '要执行就点「允许这一次」：Claude 会重试这一条，只放这一条、一次，10 分钟内有效。不点就照样不执行。也可以回复 **y** / **n**。' + (mins ? `${mins} 分钟内不回按不允许。` : ''),
+    hint: (mins) => '要执行就点「允许这一次」：Claude 会重试，10 分钟内这条命令里的操作都放行（拆开来跑也算），别的不放。不点就照样不执行。也可以回复 **y** / **n**。' + (mins ? `${mins} 分钟内不回按不允许。` : ''),
     controls: (id) => [buttonRow([button('允许这一次', { a: 'allow', id }, 'primary_filled'), button('不允许', { a: 'deny', id })])],
     fromText: (t) => ({ behavior: /^(y|yes|ok|好|是|允许|可以|同意)$/i.test(t) ? 'allow' : 'deny' }),
     fromClick: (v) => ({ behavior: v.a === 'allow' ? 'allow' : 'deny' }),
@@ -1065,12 +1087,11 @@ async function run() {
     gone.addEventListener('abort', () => ctl.abort('会话那边已经不等了'));
     const r = await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...deniedSpec(req), signal: ctl.signal, mirror: mirrorOf(s), sid: req.session_id }));
     if (r?.behavior !== 'allow') return null;
-    grants.push({ sid: req.session_id, tool: req.tool_name, key: grantKey(req.tool_name, req.tool_input), until: Date.now() + 10 * 60e3, stage: 'granted' });
-    syncGrants();
+    addGrant(req.session_id, req.tool_name, req.tool_input);
     log('grant', req.session_id.slice(0, 8), req.tool_name);
     return { retry: true };
   }
-  const onPreTool = (req) => (takeGrant(req.session_id, req.tool_name, req.tool_input, 'granted', 'asked') ? (log('grant ask', req.session_id.slice(0, 8), req.tool_name), { ask: true }) : null);
+  const onPreTool = (req) => (preTool(req.session_id, req.tool_name, req.tool_input) ? (log('grant ask', req.session_id.slice(0, 8), req.tool_name), { ask: true }) : null);
 
   fs.rmSync(APPROVE_SOCK, { force: true });
   net.createServer((c) => {
@@ -1273,7 +1294,8 @@ async function run() {
   }
   const notFound = (ref) => ({ error: `找不到「${ref}」，先用 list_tasks 看编号` });
   // 话题里等你确认时，私聊也放一张同样的卡片
-  const mirrorOf = (s) => ((s.task || s.notify) && !s.dm && dmChat() ? { chat: dmChat(), title: s.title ?? '会话' } : undefined);
+  // 话题里问你的卡片（审批、选择题、自动模式拦下）默认只发在话题里；配置 mirror_cards: true 时私聊也同步一张
+  const mirrorOf = (s) => (cfg.mirror_cards === true && (s.task || s.notify) && !s.dm && dmChat() ? { chat: dmChat(), title: s.title ?? '会话' } : undefined);
   function notifyDone(id, icon, what, text) {
     const s = session(id), chat = dmChat();
     if (!chat) return;
@@ -1710,7 +1732,7 @@ async function run() {
     const notes = [];
     if (s && running.has(t.id)) notes.push('正在跑的这一轮不变，下一条消息开始生效。');
     if (s && !procs.has(t.id) && s.socket && alive(s.socket)) notes.push('这个会话现在开在桌面版里，由桌面版跑，要在电脑上切；它关掉后再从这里续跑时用这里选的。');
-    const val = (k, v) => ({ a: 'pick', k, v, sid: t.id ?? '' });
+    const val = (k, v) => ({ a: 'setpick', k, v, sid: t.id ?? '' });
     return [
       { tag: 'markdown', content: `⚙️ **${s ? '这个话题的会话' : '默认'}**${s ? '' : '（秘书和以后新开的会话；话题里单独选过的不变）'}\n模型 **${modelName(model)}** · 模式 **${modeName(mode)}**${notes.length ? `\n${notes.join('\n')}` : ''}` },
       { tag: 'markdown', content: '模型（「默认」用电脑上的设置）' },
@@ -2127,7 +2149,7 @@ async function run() {
         return { toast: { type: 'success', content: '正在停止' }, ...(st && { card: { type: 'raw', data: JSON.parse(cardOf(statusCard(v.sid, st))) } }) };
       }
       if (/^(no)?(dispatch|send)$/.test(v.a)) return answerAsk(v); // 秘书派活、递话的确认
-      if (v.a === 'pick') { // 选模型、模式
+      if (v.a === 'setpick' || (v.a === 'pick' && v.k)) { // 选模型、模式（选择题的选项也叫 pick，但不带 k）
         if (v.sid && !state.sessions[v.sid]) return { toast: { type: 'info', content: '找不到这个会话' } };
         const t = { id: v.sid || null };
         setPick(t, v.k, v.v);
