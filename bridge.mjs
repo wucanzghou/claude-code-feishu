@@ -66,6 +66,7 @@ const secretaryNote = (confirm) => [
   '有一份「等用户拍板的事」清单，用 pending_list / pending_add / pending_remove 管，换新秘书时整份交接过去，聊过的话不一定带得过去，所以要靠它记。你问了用户要他拍板或回答的问题，或者知道某件事在等用户决定、等他动手（方案等他点头、提交被权限拦下要他在电脑上处理、他说「待定」「先放着」的），当轮就 pending_add 记一条；用户答了、办完了、或者说不用了，就 pending_remove 删掉。派出去的任务汇报里写着等用户的，转发程序会自动记上，不用重复记，了结时照样要删。用户问「还有啥没定的」「有什么等我的」时，先 pending_list，照清单答；觉得哪条可能已经办了，先查实再说。',
   '用户指定用哪个模型或权限模式派活时，start_task 填 model / permission_mode；没指定就不填。用户想改以后默认的模型、模式，告诉他在私聊发 /model、/mode。',
   '用户问进展时用 list_tasks / task_detail 查；给任务补充指示用 send_to_task（也能递给电脑上开着的桌面会话）；要停用 stop_task。',
+  '任务做完、出错、等用户回复时，私聊里会收到一张通知卡片。用户长按那张通知回复，话由转发程序直接转给那个任务，不经过你，你也看不到；想知道后来怎样了用 task_detail 查。用户想直接回某个任务时，告诉他长按那条通知回复就行。',
   '汇报照实说：没查到就说没查到，没做完就说没做完，不要编。说话简短口语化，像发微信，少用表格和长清单。',
 ].join('\n');
 // 秘书派出去干活的会话
@@ -607,7 +608,7 @@ async function run() {
       if (s.notify && !s.stopped && texts.length && !quiet) {
         if (report) s.notified = report;
         const took_ = took ? ` · 用时 ${duration(Date.now() - took)}` : '';
-        notifyDone(ev.session_id, forYou ? '⏸' : '✅', forYou ? `等你回复${took_}（在话题里回复就接着做）` : `这一轮结束${took_}`, report ?? clip(md.replace(/\s+/g, ' '), 200));
+        notifyDone(ev.session_id, forYou ? '⏸' : '✅', forYou ? `等你回复${took_}（长按这条回复就直接回给它，也可以在话题里回）` : `这一轮结束${took_}`, report ?? clip(md.replace(/\s+/g, ' '), 200));
         if (!s.task) s.notify = false; // 电脑上开着的会话：只报秘书递话的那一轮
       }
     }
@@ -857,12 +858,12 @@ async function run() {
       msg = await post(parts.at(-1), root, chat);
     }
     const shown = parts.length === 1 ? spec.body : '（内容见上面几条）';
-    // 秘书派的活在话题里问你时，私聊也发一张同样带按钮的卡片，在哪边点都行。私聊这张只认按钮：
-    // 私聊里打的字是发给秘书的，不当成回这一条
+    // 秘书派的活在话题里问你时，私聊也发一张同样带按钮的卡片，在哪边点都行。私聊里直接打的字是发给秘书的；
+    // 长按这张卡片回复的字算回这个任务（记进 dm_cards，见「私聊里引用回复任务」）
     const mirror = spec.mirror && postCard([
-      { tag: 'markdown', content: `⏸ **${spec.mirror.title}** 在等你\n\n${clip(spec.body, 6000)}\n\n在这里点按钮就行；私聊里打字是发给秘书的，不算回这一条。` },
+      { tag: 'markdown', content: `⏸ **${spec.mirror.title}** 在等你\n\n${clip(spec.body, 6000)}\n\n在这里点按钮，或长按这条回复文字；不引用直接打字是发给秘书的。` },
       ...spec.controls(id),
-    ], null, spec.mirror.chat).catch((e) => (log('mirror card failed', e.message), null));
+    ], null, spec.mirror.chat).then((m) => (spec.sid && rememberCard(m, spec.sid), m), (e) => (log('mirror card failed', e.message), null));
     return new Promise((resolve) => {
       let timer;
       // 答完把两张卡片都改成结果；clicked 是点按钮的那张，由回调响应去改
@@ -1071,7 +1072,7 @@ async function run() {
     const q = req.tool_name === 'AskUserQuestion' && questionSpec(req.tool_input ?? {});
     const spec = q ? { ...q, hint: (mins) => `${q.hint(mins)}电脑上也在问，哪边先答算哪边。`, onTimeout: () => null, onAbort: () => null } : approvalSpec(req, true, lastSaid(s));
     try {
-      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...spec, signal: ctl.signal, mirror: mirrorOf(s) }));
+      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...spec, signal: ctl.signal, mirror: mirrorOf(s), sid: req.session_id }));
     } finally { stop(); }
   }
 
@@ -1357,7 +1358,44 @@ async function run() {
     const s = session(id), chat = dmChat();
     if (!chat) return;
     postCard([{ tag: 'markdown', content: `${icon} **${s.title ?? '会话'}** ${what}${text ? `\n${text}` : ''}` }, buttonRow([button('在桌面打开', { a: 'desk', sid: id })])], null, chat)
-      .catch((e) => log('notify failed', e.message));
+      .then((m) => rememberCard(m, id), (e) => log('notify failed', e.message));
+  }
+
+  // ───── 私聊里引用回复任务 ─────
+  // 发到私聊、关于某个任务的卡片（做完通知、镜像的确认卡片、转交回执）记下 消息 id → 会话 id（state.dm_cards，留 7 天，
+  // 重启后旧卡片照样认）。私聊里长按其中一张「回复」，那条消息不交给秘书，按在那个话题里回复处理：
+  // 在跑就插进这一轮，进程退了就续跑，话题里有等你回答的卡片就当回答。引用别的消息照旧交给秘书
+  const CARD_KEEP = 7 * 86400e3;
+  const dmCards = () => (state.dm_cards ??= {});
+  const pruneCards = () => { for (const [k, v] of Object.entries(dmCards())) if (!(Date.now() - v.at <= CARD_KEEP)) delete dmCards()[k]; };
+  pruneCards();
+  function rememberCard(mid, sid) {
+    if (!mid || !sid) return;
+    pruneCards();
+    dmCards()[mid] = { sid, at: Date.now() };
+    save();
+  }
+  // 飞书里引用回复带 parent_id（引用的那条）和 root_id（回复链最早那条），哪个命中都算
+  const quotedSid = (m) => [m.parent_id, m.root_id].map((q) => q && dmCards()[q]?.sid).find(Boolean) ?? null;
+  // 和在话题里回复的区别：不清 notify，反而打开（你是在私聊里回的，这一轮做完、出错、再等你时照样私聊通知），
+  // 话题里贴一条原话（话题里没有你这条消息），私聊回一句回执（回执也记下，引用它回复同样转给这个任务）
+  async function replyToTask(id, text, shown, m) {
+    const s = state.sessions[id], title = titleOfSession(s);
+    const was = { notify: s.notify, notified: s.notified };
+    Object.assign(s, { notify: true, notified: undefined }); // notified：同一句汇报不重复报，这轮是你新问的，照样报
+    await drain(); // 拿到最新的收件地址，回执才说得准
+    const how = running.has(id) ? '，它正在跑，插进这一轮' : s.socket && alive(s.socket) ? '，送进电脑上开着的那个会话' : '，接着做';
+    await post(`📨 **私聊回复**：${clip(shown, 3000)}`, s.root).catch((e) => log('quote echo failed', e.message));
+    const why = await continueSession(id, text);
+    if (why) {
+      Object.assign(s, was);
+      save();
+      post(`⚠️ 上面这条没送进去：${why}`, s.root).catch(() => {});
+      return post(`⚠️ 没转给「${title}」：${why}`, null, m.chat_id);
+    }
+    save();
+    log('dm quote', id.slice(0, 8));
+    rememberCard(await post(`↪️ 已转给「${title}」${how}`, null, m.chat_id).catch(() => null), id);
   }
 
   function listTasks() {
@@ -1944,7 +1982,16 @@ async function run() {
       }
     } catch {}
     text = text.replace(/@_user_\d+/g, '').trim();
-    const key = dm ? m.chat_id : m.root_id || m.message_id;
+    // 私聊里长按任务通知回复的：key 换成那个任务的话题，下面按在话题里回复处理（回答话题里在等的卡片、续跑或插话）；
+    // 提示、回执照样发在私聊。/stop 停那个任务；其他私聊命令照常是私聊的命令
+    let via = dm ? quotedSid(m) : null;
+    if (via && /^\/(file|model|mode|new|cd|help|tasks|pending|board|大屏)\b/i.test(text)) via = null;
+    if (via && !state.sessions[via]?.root) {
+      log('dm quote: task gone', via.slice(0, 8));
+      return post('引用的这个任务已经找不到了，这条没转。要转给秘书就不引用再发一次。', null, m.chat_id);
+    }
+    const key = via ? state.sessions[via].root : dm ? m.chat_id : m.root_id || m.message_id;
+    const shown = [text, images.length && `[图片 ×${images.length}]`, files.length && `[文件] ${files.map((f) => f.name).join('、')}`].filter(Boolean).join(' ');
     let lateNote = '';
     if (late) {
       // 晚到几分钟的消息不当命令、不当审批的回答：可能停掉后来新开的一轮，或答到另一张卡片上
@@ -1954,7 +2001,12 @@ async function run() {
       post(`📮 补收到你 ${at} 发的消息（当时网络断了没收到），现在转给 Claude。`, ...where).catch(() => {});
       lateNote = `（这条是用户 ${at} 发的，当时飞书没推送过来，转发程序现在才补收到，这期间情况可能已经变了）`;
     } else {
-      if (await phoneCommand(text, m, dm, key)) return;
+      if (via && /^\/stop\b/i.test(text)) {
+        const s = state.sessions[via];
+        if (stopTask(via)) return react(m.message_id);
+        return post(s.socket && alive(s.socket) ? `「${titleOfSession(s)}」在桌面版或终端里运行，手机上停不了，请在电脑上停。` : `「${titleOfSession(s)}」现在没在跑。`, null, m.chat_id);
+      }
+      if (!via && await phoneCommand(text, m, dm, key)) return;
       if (answerPending(key, text, m)) return;
     }
     if (images.length) {
@@ -1977,6 +2029,7 @@ async function run() {
       }
     }
     if (text && lateNote) text = `${lateNote}\n${text}`;
+    if (via) return text ? replyToTask(via, text, shown, m) : post('暂时只支持文字、图片和文件。', null, m.chat_id);
     if (dm) return onDirectMessage(m, text);
     if (!text) return post('暂时只支持文字、图片和文件。', key);
 
@@ -2006,7 +2059,9 @@ async function run() {
     secretaryOn()
       ? `这里是你的秘书：一个一直开着的 Claude 会话。小事它自己做，大活它派到群里单独的话题里做${cfg.dispatch_confirm === false ? '' : '（要你点「派」才开始）'}，做完、出错、等你确认时这里会收到通知。`
       : '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
-    ...(secretaryOn() ? ['`/tasks` 看派出去的任务和电脑上开着的会话', '`/pending` 看等你拍板的事（秘书记的；办完了跟秘书说一声它就删）'] : []),
+    ...(secretaryOn() ? [
+      '长按任务的通知卡片「回复」：打的字（图片也行）直接回给那个任务，不经过秘书；它在跑就插进这一轮，停了就接着做，话题里也会贴上你这句。引用回复 `/stop` 停那个任务',
+      '`/tasks` 看派出去的任务和电脑上开着的会话', '`/pending` 看等你拍板的事（秘书记的；办完了跟秘书说一声它就删）'] : []),
     '`/大屏` 一张置顶、自动刷新的任务汇总：等你处理的、正在跑的、6 小时内完成的',
     `\`/new [内容]\` ${secretaryOn() ? '换一个新的秘书会话（派出去的任务不受影响）' : '结束当前任务，开新任务'}`,
     `\`/cd <别名或绝对路径> [内容]\` 在指定目录开新${secretaryOn() ? '的秘书会话' : '任务'}`,
@@ -2542,11 +2597,11 @@ async function run() {
         missed.sort((a, b) => a.it.create_time - b.it.create_time);
         for (const { chat, type, it } of missed) {
           if (!claim(it.message_id)) continue;
-          log('late', why, type, it.msg_type, it.message_id, it.root_id ? 'in ' + it.root_id : '');
+          log('late', why, type, it.msg_type, it.message_id, it.root_id ? 'in ' + it.root_id : '', it.parent_id && it.parent_id !== it.root_id ? 're ' + it.parent_id : '');
           await onPhoneMessage({
             late: true,
             sender: { sender_id: { open_id: it.sender.id } },
-            message: { message_id: it.message_id, chat_id: it.chat_id || chat, chat_type: type, message_type: it.msg_type, content: it.body?.content ?? '{}', root_id: it.root_id, create_time: it.create_time },
+            message: { message_id: it.message_id, chat_id: it.chat_id || chat, chat_type: type, message_type: it.msg_type, content: it.body?.content ?? '{}', root_id: it.root_id, parent_id: it.parent_id, create_time: it.create_time },
           }).catch((e) => log('late message failed', it.message_id, e.message));
         }
       } catch (e) {
@@ -2561,7 +2616,7 @@ async function run() {
     'im.message.receive_v1': (data) => {
       const m = data.message;
       // 收到什么先记一笔（不记内容），丢消息时才查得出是飞书没推还是这里过滤掉了
-      log('recv', m.chat_type, m.message_type, m.message_id, m.root_id ? 'in ' + m.root_id : '');
+      log('recv', m.chat_type, m.message_type, m.message_id, m.root_id ? 'in ' + m.root_id : '', m.parent_id && m.parent_id !== m.root_id ? 're ' + m.parent_id : '');
       if (!claim(m.message_id)) return; // 飞书偶尔重复推送；补收已经处理过的也跳过
       const late = Date.now() - Number(m.create_time) > 120e3; // 断线后飞书隔了很久才重推的
       if (late) log('late redelivered', m.message_id, Math.round((Date.now() - Number(m.create_time)) / 60e3) + ' min');
