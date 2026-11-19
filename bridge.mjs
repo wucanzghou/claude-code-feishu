@@ -413,6 +413,19 @@ async function run() {
     return s.root;
   }
 
+  // 别的 Claude 会话经收件 socket 发来的话：<cross-session-message from="uds:/tmp/cc-socks/<pid>.sock" from-name="…">正文</…>。
+  // 按 socket 找到是哪个会话（用它的标题），找不到用 from-name
+  const AUTO_PROMPT = /^\s*<(task-notification|cross-session-message)\b/;
+  function crossSession(prompt) {
+    const m = prompt.match(/^\s*<cross-session-message\b([^>]*)>([\s\S]*?)(?:<\/cross-session-message>\s*)?$/);
+    if (!m) return null;
+    const attr = (k) => m[1].match(new RegExp(`\\b${k}="([^"]*)"`))?.[1];
+    const sock = attr('from')?.replace(/^uds:/, '');
+    const sid = sock && Object.keys(state.sessions).find((id) => state.sessions[id].socket === sock);
+    const from = (sid ? titleOfSession(state.sessions[sid]) : attr('from-name')) || '另一个会话';
+    return { from: from.replace(/\*/g, '').slice(0, 40), text: m[2].trim() };
+  }
+
   async function handleEvent(ev) {
     const s = session(ev.session_id);
     // cwd 是会话眼下所在的目录（Claude 用 cd 换过就跟着变，发文件按它算相对路径）；
@@ -432,7 +445,7 @@ async function run() {
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
       // 后台命令、Monitor 事件触发的自动一轮（<task-notification>）记下来：结束时没写汇报就不往私聊报。
       // 自动一轮里你又插了话，这一轮就算你的
-      const isAuto = /^\s*<task-notification>/.test(ev.prompt) && !s.pending.some((t) => ev.prompt.includes(t));
+      const isAuto = AUTO_PROMPT.test(ev.prompt) && !s.pending.some((t) => ev.prompt.includes(t));
       if (!isAuto) s.turn_auto = false;
       else if (!s.busy_since) s.turn_auto = true;
       s.busy_since ??= ev.at ?? Date.now(); // 大屏：这一轮从什么时候开始
@@ -449,15 +462,17 @@ async function run() {
           return save();
         }
       }
-      // 后台命令、子任务跑完后 Claude Code 自己接着开的一轮（<task-notification>）：不是谁打的字，
-      // 沿用上一轮是谁发起的，也不回显
-      const auto = i < 0 && /^\s*<task-notification>/.test(ev.prompt);
+      // 后台命令、子任务跑完后 Claude Code 自己接着开的一轮（<task-notification>），或者别的 Claude 会话
+      // 发来的话（<cross-session-message>）：不是你打的字，沿用上一轮是谁发起的；前者不回显，后者标明是哪个会话发来的
+      const auto = i < 0 && AUTO_PROMPT.test(ev.prompt);
+      const cross = auto ? crossSession(ev.prompt) : null;
       // phone 记下这一轮是谁发起的：手机发起的那一轮，权限确认才转到手机
       if (!auto) s.phone = i >= 0;
       if (!s.phone) s.notify = false; // 你在电脑上接着聊了，之后各轮不再往私聊报
       await finishStatus(ev.session_id, '⏹ 已结束'); // 上一轮被中断时收不到 Stop
       if (s.phone) startStatus(ev.session_id);
       if (i >= 0) s.pending.splice(i, 1); // 手机发来的，不回显
+      else if (cross) await post(`🔗 **${cross.from}** 发来：${clip(cross.text, 800)}`, s.dm ? null : await topic(ev.session_id, titleOf(readTail(s.transcript)), cross.text.slice(0, 40)), s.dm);
       else if (auto) {}
       else if (s.dm) await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, null, s.dm);
       else await post(`🖥 **桌面**：${ev.prompt.slice(0, 3000)}`, await topic(ev.session_id, titleOf(readTail(s.transcript)), ev.prompt.slice(0, 40)));
