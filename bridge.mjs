@@ -10,6 +10,7 @@
 // 手机 → 桌面：话题里的回复经会话自带的收件 socket，注入正在运行的那个会话
 // 手机开新话题：起一个命令行会话（claude -p）去做，同一话题里接着聊
 // 私聊机器人：不进群，一条消息就是一个临时任务（claude -p），在 dm_workdir 里做，连着发接着聊
+// 桌面版定时任务：扫对话记录目录，最终回复第一行不是「正常」时私聊提醒
 import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -1534,6 +1535,130 @@ async function run() {
     return startTask(m, text);
   }
 
+  // ───── 定时任务提醒 ─────
+  // 桌面版的定时任务每次跑是一个新会话，第一条用户消息以 <scheduled-task name="…"> 开头。这里定时扫对话记录目录，
+  // 不靠钩子（桌面版跑定时任务时全局钩子触不触发没法事先确认）。一次运行跑完了（最后是 Stop 钩子摘要或 API 报错，
+  // 且一分钟没再写）就看最终回复的第一行：是「正常」不打扰，其余（有结论、没跑成、没输出、报错）私聊发一条提醒；
+  // 一小时没动静也没跑完的，当卡住了提醒。每个会话只看一次，看过的记在 state.sched.done，重启也不重发
+  const PROJECTS = path.join(os.homedir(), '.claude/projects');
+  const SCHED_TAG = /^\s*<scheduled-task name="([^"]+)"/;
+  const SCHED_SETTLE = 60e3, SCHED_STUCK = 3600e3, SCHED_WINDOW = 12 * 3600e3;
+  if (!state.sched) {
+    state.sched = { since: Date.now(), done: {} }; // 头一次上线之前的运行不补发
+    save();
+  }
+  const sched = state.sched;
+  const schedHeads = new Map(); // 对话文件 → { name, start }；不是定时任务的记 null
+  // 第一条用户消息：是定时任务就返回任务 id 和开跑时间；还没写到第一条用户消息时返回 undefined，下回再看
+  function schedHead(file) {
+    let text = '';
+    try {
+      const fd = fs.openSync(file, 'r');
+      const buf = Buffer.alloc(256 << 10);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      fs.closeSync(fd);
+      text = buf.toString('utf8', 0, n);
+    } catch { return undefined; }
+    for (const l of text.split('\n')) {
+      let r;
+      try { r = JSON.parse(l); } catch { continue; }
+      if (r.type !== 'user' || r.isMeta) continue;
+      const c = r.message?.content;
+      const t = typeof c === 'string' ? c : Array.isArray(c) ? c.find((b) => b.type === 'text')?.text : undefined;
+      const m = t?.match(SCHED_TAG);
+      return m ? { name: m[1], start: Date.parse(r.timestamp) || 0 } : null;
+    }
+    return undefined;
+  }
+  // 最后一轮跑完没有，最终回复是什么。最终回复只算最后一次工具调用之后的文字：
+  // 巡检中途会说「正在核实…」再接着查，那句不是结论
+  function schedResult(records) {
+    const i = records.findLastIndex((r) => isPrompt(r) && r.type === 'user');
+    let out = [], error = false;
+    for (const r of records.slice(i + 1)) {
+      if (r.isSidechain) continue;
+      const c = Array.isArray(r.message?.content) ? r.message.content : [];
+      if ((r.type === 'assistant' && c.some((b) => b.type === 'tool_use')) || (r.type === 'user' && c.some((b) => b.type === 'tool_result'))) out = [];
+      else if (r.type === 'assistant') {
+        const t = c.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+        if (t) out.push(t);
+        error = !!r.isApiErrorMessage;
+      }
+    }
+    const last = records.findLast((r) => r.type === 'assistant' || r.type === 'user' || (r.type === 'system' && r.subtype === 'stop_hook_summary'));
+    const ended = last?.type === 'system' || !!last?.isApiErrorMessage;
+    return { ended, error, text: out.join('\n').trim() };
+  }
+  // 显示名在桌面版的 scheduled-tasks.json 里（只读）
+  function schedName(id) {
+    const base = path.join(os.homedir(), 'Library/Application Support/Claude/claude-code-sessions');
+    try {
+      for (const a of fs.readdirSync(base)) for (const b of fs.readdirSync(path.join(base, a))) {
+        const t = readJSON(path.join(base, a, b, 'scheduled-tasks.json'), {}).scheduledTasks?.find((x) => x.id === id);
+        if (t?.displayName) return t.displayName;
+      }
+    } catch {}
+    return id;
+  }
+  const isNormal = (line) => /^[\s*_#>]*正常[\s*_。.!！]*$/.test(line);
+  async function checkScheduled(sid, file, head, quiet) {
+    const r = schedResult(readTail(file));
+    if (!r.ended && quiet < SCHED_STUCK) return; // 还在跑（巡检中途常有几分钟不写）
+    const lines = r.text.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (r.ended && !r.error && isNormal(lines[0] ?? '')) {
+      sched.done[sid] = { at: Date.now(), ok: true };
+      log('scheduled ok', head.name, sid.slice(0, 8));
+      return save();
+    }
+    let first = lines[0] ?? '', rest = lines.slice(1);
+    if (!r.ended) [first, rest] = [`${Math.round(quiet / 60e3)} 分钟没动静，可能卡住了（在等确认，或者中途断了）`, lines.slice(-3)];
+    else if (!first) first = '跑完了，但最后没有文字结论';
+    const clip1 = (t, n) => (t.length > n ? t.slice(0, n) + '…' : t);
+    let body = rest.slice(0, 6).map((l) => clip1(l, 160)).join('\n');
+    if (rest.length > 6) body += `\n…（还有 ${rest.length - 6} 行，桌面上看全文）`;
+    await postCard([
+      { tag: 'markdown', content: `⚠️ **${schedName(head.name)}**：${clip1(first, 300)}${body ? `\n${body}` : ''}` },
+      buttonRow([button('在桌面打开', { a: 'open', sid })]),
+    ], null, dmChat());
+    sched.done[sid] = { at: Date.now(), sent: true };
+    log('scheduled alert sent', head.name, sid.slice(0, 8));
+    save();
+  }
+  let scanning = false;
+  async function scanScheduled() {
+    if (scanning || !dmChat()) return;
+    scanning = true;
+    try {
+      const now = Date.now();
+      for (const [sid, d] of Object.entries(sched.done)) if (now - d.at > 30 * 86400e3) delete sched.done[sid];
+      let dirs = [];
+      try { dirs = fs.readdirSync(PROJECTS); } catch {}
+      for (const d of dirs) {
+        let names = [];
+        try { names = fs.readdirSync(path.join(PROJECTS, d)); } catch {}
+        for (const n of names) {
+          const sid = n.slice(0, -6);
+          if (!n.endsWith('.jsonl') || sched.done[sid]) continue;
+          const file = path.join(PROJECTS, d, n);
+          let mtime;
+          try { mtime = fs.statSync(file).mtimeMs; } catch { continue; }
+          if (mtime < sched.since || now - mtime > SCHED_WINDOW || now - mtime < SCHED_SETTLE) continue;
+          if (!schedHeads.has(file)) {
+            const h = schedHead(file);
+            if (h === undefined) continue;
+            schedHeads.set(file, h);
+          }
+          const head = schedHeads.get(file);
+          if (!head || head.start < sched.since) continue;
+          // 发失败（多半断网）不记，下一轮再试
+          await checkScheduled(sid, file, head, now - mtime).catch((e) => log('scheduled check failed', sid.slice(0, 8), e.message));
+        }
+      }
+    } finally { scanning = false; }
+  }
+  setInterval(scanScheduled, 30e3);
+  setTimeout(scanScheduled, 3e3);
+
   const seen = new Set();
   const dispatcher = new lark.EventDispatcher({}).register({
     'im.message.receive_v1': (data) => {
@@ -1559,6 +1684,11 @@ async function run() {
         return { toast: { type: 'success', content: '正在停止' }, ...(st && { card: { type: 'raw', data: JSON.parse(cardOf(statusCard(v.sid, st))) } }) };
       }
       if (/^(no)?(dispatch|send)$/.test(v.a)) return answerAsk(v); // 秘书派活、递话的确认
+      if (v.a === 'open') { // 定时任务提醒上的「在桌面打开」：会话本来就是桌面版的，直接跳过去，不像 desk 那样导入改标题
+        if (!/^[0-9a-f-]{36}$/.test(v.sid ?? '')) return { toast: { type: 'info', content: '找不到这个会话' } };
+        spawn('/usr/bin/open', ['-g', `claude://resume?session=${v.sid}`], { stdio: 'ignore' }).on('error', () => {});
+        return { toast: { type: 'success', content: '已在电脑的桌面版里打开' } };
+      }
       if (v.a === 'desk') { // 做完通知上的「在桌面打开」
         if (!state.sessions[v.sid]) return { toast: { type: 'info', content: '找不到这个会话' } };
         if (running.has(v.sid)) return { toast: { type: 'warning', content: '还在跑，这一轮做完再开' } };
