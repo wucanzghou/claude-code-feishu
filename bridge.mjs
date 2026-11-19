@@ -1985,7 +1985,7 @@ async function run() {
     // 私聊里长按任务通知回复的：key 换成那个任务的话题，下面按在话题里回复处理（回答话题里在等的卡片、续跑或插话）；
     // 提示、回执照样发在私聊。/stop 停那个任务；其他私聊命令照常是私聊的命令
     let via = dm ? quotedSid(m) : null;
-    if (via && /^\/(file|model|mode|new|cd|help|tasks|pending|board|大屏)\b/i.test(text)) via = null;
+    if (via && /^\/(file|model|mode|new|cd|help|tasks|pending|board|大屏)(?=\s|$)/i.test(text)) via = null; // 不用 \b：「屏」不算单词字符
     if (via && !state.sessions[via]?.root) {
       log('dm quote: task gone', via.slice(0, 8));
       return post('引用的这个任务已经找不到了，这条没转。要转给秘书就不引用再发一次。', null, m.chat_id);
