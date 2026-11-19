@@ -531,9 +531,9 @@ async function run() {
     running.set(id, []);
     const s = session(id);
     s.pending.push(text);
-    // 秘书不导入桌面：桌面版接着聊时没有派活工具，私聊消息还会被送到桌面那边去。派出去的任务一次可能好几个，
-    // 自动导入会让桌面窗口来回跳，改成做完的通知上点「在桌面打开」
-    if (!resume && cfg.desktop_import !== false && !s.secretary && !s.task) s.to_desktop = true;
+    // 秘书不导入桌面：桌面版接着聊时没有派活工具，私聊消息还会被送到桌面那边去。
+    // 派出去的任务和手机开的会话一样，第一轮做完就导入（每做完一个桌面窗口会切过去一次）
+    if (!resume && cfg.desktop_import !== false && !s.secretary) s.to_desktop = true;
     const mode = (s.dm && cfg.dm_permission_mode) || cfg.permission_mode;
     const role = s.secretary ? SECRETARY_NOTE : s.task ? WORKER_NOTE : '用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。';
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
@@ -1689,7 +1689,7 @@ async function run() {
         spawn('/usr/bin/open', ['-g', `claude://resume?session=${v.sid}`], { stdio: 'ignore' }).on('error', () => {});
         return { toast: { type: 'success', content: '已在电脑的桌面版里打开' } };
       }
-      if (v.a === 'desk') { // 做完通知上的「在桌面打开」
+      if (v.a === 'desk') { // 做完通知上的「在桌面打开」：第一轮做完已自动导入过，这里再跳过去一次（关了 desktop_import 时靠它导入）
         if (!state.sessions[v.sid]) return { toast: { type: 'info', content: '找不到这个会话' } };
         if (running.has(v.sid)) return { toast: { type: 'warning', content: '还在跑，这一轮做完再开' } };
         importToDesktop(v.sid).catch((e) => log('desktop import failed', v.sid.slice(0, 8), e.message));
