@@ -12,6 +12,7 @@
 // 私聊机器人：不进群，一条消息就是一个临时任务（claude -p），在 dm_workdir 里做，连着发接着聊
 // 桌面版定时任务：扫对话记录目录，最终回复第一行不是「正常」时私聊提醒
 // 例行任务：到点（每天几点）或有触发（远端分支有别人的新提交）时自己开一个话题会话去跑，结果完整发到私聊
+// 重启不打断：转发程序起的命令行会话由各自的中转进程（shim）拉起，转发程序重启（部署、崩溃）时会话接着跑，新进程起来后接回去
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -31,6 +32,10 @@ const LABEL = 'com.github.claude-code-feishu';
 const PLIST = path.join(os.homedir(), 'Library/LaunchAgents', LABEL + '.plist');
 const APPROVE_SOCK = path.join(HOME, 'approve.sock');
 const GRANTS = path.join(HOME, 'grants.json'); // 有手机上点过「允许这一次」、还没用掉的放行时才有这个文件
+// 中转进程的 socket 和记录文件：<会话 id 前 8 位>-<起的时刻>.sock / .log（socket 路径 macOS 限 104 字节，别用整个 id）
+const RUN = path.join(HOME, 'run');
+// 中转进程连续这么久没有转发程序连着：这一轮做完了就关输入让会话退出；两倍这么久还没退就结束进程（转发程序被删了、状态丢了时不留孤儿进程）
+const SHIM_ORPHAN = 3600e3;
 const IMAGES = path.join(HOME, 'images');
 const FILES = path.join(HOME, 'files');
 // 钩子事件 → [子命令, 超时秒]。PermissionRequest 要等手机回复，放到一天；电脑上先答了的话转发程序会提前放掉它
@@ -141,10 +146,11 @@ const writeJSON = (f, v) => {
   fs.renameSync(f + '.tmp', f);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const stdin = async () => { let s = ''; for await (const c of process.stdin) s += c; return s; };
 
-const commands = { setup, install, uninstall, run, hook, inject, approve, denied, pretool, mcp };
+const commands = { setup, install, uninstall, run, hook, inject, approve, denied, pretool, mcp, shim };
 const cmd = process.argv[2] ?? 'run';
 if (!commands[cmd]) throw new Error(`未知命令 ${cmd}，可用：${Object.keys(commands).join(' / ')}`);
 await commands[cmd]();
@@ -189,31 +195,143 @@ async function inject() {
 async function approve() {
   let line;
   try { line = JSON.stringify(JSON.parse(await stdin())) + '\n'; } catch { return; }
-  const answer = await new Promise((resolve) => {
-    let buf = '';
-    const c = net.connect(APPROVE_SOCK, () => c.write(line));
-    c.on('data', (d) => (buf += d));
-    c.on('close', () => resolve(buf));
-    c.on('error', () => resolve(''));
-  });
+  const answer = await askSock(line);
   try {
     const decision = JSON.parse(answer);
     if (decision?.behavior) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }));
   } catch {}
 }
 
-// 钩子问转发程序一句、等它回（经 approve.sock）。kind 区分是哪种钩子；连不上或超时当没回
-function askBridge(raw, kind, ms) {
-  let req;
-  try { req = { ...JSON.parse(raw), kind }; } catch { return Promise.resolve(null); }
+// 钩子问转发程序一句、等它回（经 approve.sock），返回回的原文（转发程序不表态时回 "null"）。
+// 转发程序重启（部署）时：正等着手机回的连接会断，一时也连不上（socket 文件还在、没人听）。断了就隔一秒重连再问一遍，
+// 新转发程序会接着用原来那张卡片。问过了、正等着时断的最多重试一分钟（手机上正等着的那张不能白丢）；一次都没连上的
+// 只等 5 秒（重启一两秒就好，转发程序真没在跑时不能拖住每个会话的确认）。socket 文件不在（没装、没在跑）直接当没回
+function askSock(line, { ms } = {}) {
+  const start = Date.now();
+  let asked = false;
   return new Promise((resolve) => {
-    let buf = '';
-    const c = net.connect(APPROVE_SOCK, () => c.write(JSON.stringify(req) + '\n'));
-    const timer = ms && setTimeout(() => (c.destroy(), resolve(null)), ms);
-    c.on('data', (d) => (buf += d));
-    c.on('close', () => { clearTimeout(timer); try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
-    c.on('error', () => resolve(null));
+    const attempt = () => {
+      let buf = '';
+      const c = net.connect(APPROVE_SOCK, () => { asked = true; c.write(line); });
+      const timer = ms && setTimeout(() => (c.destroy(), resolve('')), ms);
+      c.on('data', (d) => (buf += d));
+      c.on('error', () => {});
+      c.on('close', () => {
+        clearTimeout(timer);
+        if (buf || ms) return resolve(buf);
+        if ((!asked && !fs.existsSync(APPROVE_SOCK)) || Date.now() - start > (asked ? 60e3 : 5e3)) return resolve('');
+        setTimeout(attempt, 1000);
+      });
+    };
+    attempt();
   });
+}
+
+// 钩子问转发程序一句、等它回（经 approve.sock）。kind 区分是哪种钩子；连不上或超时当没回
+async function askBridge(raw, kind, ms) {
+  let req;
+  try { req = { ...JSON.parse(raw), kind }; } catch { return null; }
+  try { return JSON.parse(await askSock(JSON.stringify(req) + '\n', { ms })); } catch { return null; }
+}
+
+// ───────── 中转：转发程序起的每个命令行会话进程，都由一个中转进程拉起、持有 ─────────
+// launchd 停转发程序（部署时 install 重启、崩溃重启）会杀掉它整个进程组。中转进程是 detached 起的（自成一个进程组），
+// 不跟着死；claude 的输入输出管道连在它身上，转发程序经 unix socket 往里写，从记录文件读出来的。
+// 记录文件一行一条：h 起步（claude 和中转的进程号）、i 写进去的一行、d 输入已关没写进去的一行、o 输出的一行、
+// e 错误输出、c 关了输入、x 退出（退出码）。转发程序（重新）连上时从头重放这个文件，就知道写了几条、处理了几条、
+// 哪个审批还没答、进程退了没有。中转进程只转不想（它跑的是起它那一刻的代码，以后部署换不掉），claude 一退它就退；
+// 转发程序断开不会关 claude 的输入，只有转发程序明说 end 才关
+async function shim() {
+  const spec = JSON.parse(await stdin()); // { sock, log, cmd, args, cwd, first }
+  const note = (s) => { try { fs.appendFileSync(spec.log, s + '\n'); } catch {} };
+  let child, open = true, conn = null, away = Date.now(), idle = false, done = false;
+  const finish = (info) => {
+    if (done) return;
+    done = true;
+    note('x ' + JSON.stringify(info));
+    fs.rmSync(spec.sock, { force: true });
+    process.exit(0);
+  };
+  process.on('uncaughtException', (e) => {
+    try { child?.kill('SIGTERM'); } catch {}
+    finish({ code: null, error: `中转进程出错：${e.message}` });
+  });
+  const kill = (after = 0) => setTimeout(() => {
+    try { child.kill('SIGTERM'); } catch {}
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 5000);
+  }, after);
+  child = spawn(spec.cmd, spec.args, { cwd: spec.cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+  if (!child.pid) return child.on('error', (e) => finish({ code: null, error: e.message })); // 没起来（找不到 claude 等）
+  note('h ' + JSON.stringify({ v: 1, pid: child.pid, shim: process.pid, at: Date.now() }));
+  child.stdin.on('error', () => {});
+  child.on('error', (e) => note('e ' + JSON.stringify(e.message)));
+  const write = (line) => {
+    if (!open) return note('d ' + line);
+    note('i ' + line);
+    child.stdin.write(line + '\n');
+  };
+  const end = () => {
+    if (!open) return;
+    open = false;
+    note('c');
+    child.stdin.end();
+  };
+  write(spec.first);
+  let out = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (d) => {
+    out += d;
+    for (let i; (i = out.indexOf('\n')) >= 0;) {
+      const line = out.slice(0, i);
+      out = out.slice(i + 1);
+      if (!line.trim()) continue;
+      note('o ' + line);
+      try { idle = JSON.parse(line).type === 'result'; } catch {}
+    }
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (d) => note('e ' + JSON.stringify(d)));
+  child.on('close', (code, signal) => finish({ code, signal }));
+  // 一次只认一个转发程序连着（新连上的顶掉旧的）。请求一行一个 JSON：write 写一行进 claude、end 关输入、kill 过 after 毫秒结束进程
+  fs.mkdirSync(path.dirname(spec.sock), { recursive: true, mode: 0o700 });
+  fs.rmSync(spec.sock, { force: true });
+  net.createServer((c) => {
+    conn?.destroy();
+    conn = c;
+    let buf = '';
+    c.setEncoding('utf8');
+    c.on('data', (d) => {
+      buf += d;
+      for (let i; (i = buf.indexOf('\n')) >= 0;) {
+        let o;
+        try { o = JSON.parse(buf.slice(0, i)); } catch {}
+        buf = buf.slice(i + 1);
+        if (o?.op === 'write' && typeof o.line === 'string') write(o.line);
+        else if (o?.op === 'end') end();
+        else if (o?.op === 'kill') kill(Number(o.after) || 0);
+      }
+    });
+    c.on('error', () => {});
+    c.on('close', () => { if (conn === c) (conn = null), (away = Date.now()); });
+  }).listen(spec.sock, () => fs.chmodSync(spec.sock, 0o600));
+  setInterval(() => {
+    if (conn) return;
+    if (Date.now() - away > SHIM_ORPHAN && idle) end();
+    if (Date.now() - away > 2 * SHIM_ORPHAN) (away = Infinity), kill();
+  }, 60e3).unref();
+}
+
+// uninstall：停掉所有还在跑的会话（中转进程从 run/ 目录里找，发 kill；连不上的是残留文件，删掉）
+async function killShims() {
+  let socks = [];
+  try { socks = fs.readdirSync(RUN).filter((f) => f.endsWith('.sock')).map((f) => path.join(RUN, f)); } catch {}
+  await Promise.all(socks.map((sock) => new Promise((resolve) => {
+    const c = net.connect(sock, () => c.end(JSON.stringify({ v: 1, op: 'kill', after: 0 }) + '\n'));
+    c.on('error', () => fs.rmSync(sock, { force: true }));
+    c.on('close', resolve);
+  })));
+  for (let i = 0; i < 100 && socks.some((s) => fs.existsSync(s)); i++) await sleep(100); // 等它们退干净，最多 10 秒
+  return socks.length;
 }
 
 // 自动模式拦下一个操作（PermissionDenied 钩子）：手机发起的那一轮，转发程序发卡片问你要不要放行这一次；
@@ -240,12 +358,23 @@ async function mcp() {
   const flags = process.argv.slice(3);
   const tools = taskTools({ confirm: !flags.includes('--direct'), pending: flags.includes('--pending') });
   const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  // 连不上（转发程序正在重启）就隔一秒再连，最多一分钟；已经发出去了才断的不重发（派活可能已经办了，重发会派两遍）
   const call = (line) => new Promise((resolve) => {
-    let buf = '';
-    const c = net.connect(TASK_SOCK, () => c.write(line + '\n')); // 不能 end：半关闭后转发程序那头还没回就被关掉了
-    c.on('data', (d) => (buf += d));
-    c.on('close', () => { try { resolve(JSON.parse(buf)); } catch { resolve({ error: '转发程序没有回应（可能没在运行）' }); } });
-    c.on('error', () => resolve({ error: '连不上转发程序（可能没在运行）' }));
+    const start = Date.now();
+    const attempt = () => {
+      let buf = '', sent = false;
+      const c = net.connect(TASK_SOCK, () => { sent = true; c.write(line + '\n'); }); // 不能 end：半关闭后转发程序那头还没回就被关掉了
+      c.on('data', (d) => (buf += d));
+      c.on('error', () => {});
+      c.on('close', () => {
+        if (sent) {
+          try { return resolve(JSON.parse(buf)); } catch { return resolve({ error: '转发程序没有回应（可能刚好在重启）。这一步做成没有不确定，先用 list_tasks 看看再决定要不要重做' }); }
+        }
+        if (Date.now() - start < 60e3) return setTimeout(attempt, 1000);
+        resolve({ error: '连不上转发程序（可能没在运行）' });
+      });
+    };
+    attempt();
   });
   async function handle(req) {
     const reply = (result) => out({ jsonrpc: '2.0', id: req.id, result });
@@ -351,11 +480,14 @@ async function install() {
   console.log(`已启动并设为开机自启：${LABEL}，日志 ${out}`);
 }
 
-function uninstall() {
+// install 重启转发程序不动正在跑的会话（它们挂在各自的中转进程上，新转发程序会接回去）；uninstall 才把它们一起停掉
+async function uninstall() {
   writeJSON(SETTINGS, stripHooks(readJSON(SETTINGS, {})));
   launchctl('bootout', `gui/${process.getuid()}/${LABEL}`);
   fs.rmSync(PLIST, { force: true });
-  console.log(`已摘掉钩子和自启，配置和状态留在 ${HOME}`);
+  const n = await killShims();
+  for (const f of [APPROVE_SOCK, TASK_SOCK]) fs.rmSync(f, { force: true });
+  console.log(`已摘掉钩子和自启${n ? `，停掉了 ${n} 个还在跑的会话` : ''}，配置和状态留在 ${HOME}`);
 }
 
 function stripHooks(settings) {
@@ -634,7 +766,8 @@ async function run() {
     const needle = JSON.stringify(text).slice(1, -1);
     for (let attempt = 0; attempt < 2; attempt++) {
       const ok = await new Promise((resolve) => {
-        const child = spawn(process.execPath, [SELF, 'inject'], { stdio: ['pipe', 'ignore', 'ignore'] });
+        // detached：转发程序这时候重启（部署）也不会把正在送的这条掐断
+        const child = spawn(process.execPath, [SELF, 'inject'], { stdio: ['pipe', 'ignore', 'ignore'], detached: true });
         child.on('exit', (code) => resolve(code === 0)).on('error', () => resolve(false));
         child.stdin.end(JSON.stringify({ socket: s.socket, token: s.token, content: note + text }));
       });
@@ -650,7 +783,7 @@ async function run() {
   // 同一会话同一时刻只跑一个 claude -p：上一条没跑完时后来的消息先排队，跑完合成一条再续，
   // 免得两个 --resume 并行把一份对话分叉成两份
   const running = new Map(); // sessionId -> 排队中的消息
-  const procs = new Map(); // sessionId -> { child, send }，停止时用
+  const procs = new Map(); // sessionId -> 中转进程（shimProc：pid、send、inject、said），停止、插话、审批理由用
   // 在某个 Claude Code 会话里手动起转发程序时，会继承那个会话的入口、收件 socket、API 地址等环境变量；
   // 原样传给 claude -p，钩子会把它当成那个会话（桌面版）的事件。launchd 起的没有这些，不受影响
   // CLAUDE_CODE_ENABLE_TODO_TOOLS：较新的模型在 -p 下默认不给任务清单工具（TaskCreate / TaskUpdate），
@@ -662,11 +795,12 @@ async function run() {
     return env;
   }
   // 用桌面版同款的 stream-json 模式跑：权限确认和 AskUserQuestion 选择题经 stdio 问到这里（answerTool），
-  // 纯文本 -p 模式下没有 AskUserQuestion。一个进程只跑一条消息，跑完关掉输入让它退出
+  // 纯文本 -p 模式下没有 AskUserQuestion。一个进程只跑一条消息，跑完关掉输入让它退出。
+  // claude 进程由中转进程拉起、持有（见 shim()）：转发程序重启时会话接着跑，新转发程序从记录文件接回来（adoptShims）
   function runCli(id, text, resume) {
-    if (running.has(id)) return running.get(id).push(text);
-    running.set(id, []);
     const s = session(id);
+    if (running.has(id)) return running.get(id).push(text), save(); // 排着的消息就是 s.queued，存在 state 里，重启不丢
+    running.set(id, (s.queued = []));
     s.pending.push(text);
     // 秘书不导入桌面：桌面版接着聊时没有派活工具，私聊消息还会被送到桌面那边去。
     // 派出去的任务和手机开的会话一样，第一轮做完就导入（每做完一个桌面窗口会切过去一次）
@@ -690,73 +824,253 @@ async function run() {
       if (s.routine.allow?.length) args.push('--allowedTools', s.routine.allow.join(','));
     }
     const dir = (s.home ??= firstCwd(s.transcript) ?? s.cwd ?? cfg.workdir);
-    const child = spawn(cfg.claude, args, { cwd: dir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     s.busy_since ??= Date.now(); // 大屏：钩子没来得及报时也知道从什么时候开始跑
     log('cli start', id.slice(0, 8), resume ? 'resume' : 'new', dir);
-    const send = (o) => child.stdin.writable && child.stdin.write(JSON.stringify(o) + '\n');
+    const tag = `${id.slice(0, 8)}-${Date.now().toString(36)}`;
+    const sh = (s.shim = { sock: path.join(RUN, `${tag}.sock`), log: path.join(RUN, `${tag}.log`) });
+    fs.mkdirSync(RUN, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(sh.log, '', { mode: 0o600 });
+    const p = shimProc(id, sh);
+    procs.set(id, p);
+    save();
+    // detached：自成一个进程组，launchd 停转发程序时不连带杀掉
+    const child = spawn(process.execPath, [SELF, 'shim', tag], { cwd: dir, env: childEnv(), detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+    child.on('error', (e) => p.exited({ code: null, error: `中转进程没起来：${e.message}` }));
+    if (child.pid) (sh.pid = child.pid), save(); // 中转进程还没来得及写记录就碰上重启，也认得出它还活着
     child.stdin.on('error', () => {});
-    // sent / taken：写进去几条、CLI 开始处理（回显）了几条。全都处理完的那次 result 才关输入，
-    // 关之前插话直接写进去，Claude 下一步之前就能看到；said：Claude 最近说的一句话，审批卡片上当理由
-    const p = { child, send, sent: 1, taken: 0, ending: false, said: '' };
+    child.stdin.end(JSON.stringify({ ...sh, cmd: cfg.claude, args, cwd: dir, first: JSON.stringify({ type: 'user', message: { role: 'user', content: text } }) }));
+    child.unref();
+    attachShim(id, p, false);
+  }
+
+  // 一个中转进程（= 一个 claude 进程）在转发程序这边的样子。状态都由记录文件按顺序重放出来，重启后从头读一遍就复原：
+  // sent / taken：写进去几条用户消息、CLI 开始处理（回显）了几条，全都处理完的那次 result 才关输入，关之前插话直接写进去；
+  // inflight：已经交给中转进程、还没出现在记录里的（也算写进去了，免得紧贴着 result 插的话被关在外面）；
+  // said：Claude 最近说的一句话，审批卡片上当理由；asked：claude 问过的审批（request_id → 请求），answered：记录里已经答过的。
+  // live：重放完了。重放时不发卡片、不关输入，读到眼下这一行之后才按最终状态行动
+  function shimProc(id, sh) {
+    const s = session(id);
+    const p = { sh, pid: 0, shimPid: 0, sent: 0, taken: 0, inflight: [], ending: false, idle: false, said: '', err: '', failed: false,
+      live: false, closed: false, offset: 0, conn: null, outbox: [], asked: new Map(), answered: new Set(), handled: new Set() };
+    const op = (o) => {
+      const line = JSON.stringify({ v: 1, ...o }) + '\n';
+      if (p.conn) p.conn.write(line);
+      else p.outbox.push(line); // 还没连上（刚起、或重连中）：连上再发
+    };
+    p.send = (msg) => {
+      const line = JSON.stringify(msg);
+      if (msg.type === 'user') p.inflight.push(line);
+      op({ op: 'write', line });
+    };
+    p.end = () => { if (!p.ending) (p.ending = true), op({ op: 'end' }); };
+    p.kill = (after) => op({ op: 'kill', after });
     p.inject = (t) => {
-      if (p.ending || s.stopped) return false;
+      if (!p.live || p.ending || p.closed || s.stopped) return false;
       s.pending.push(t);
       (s.midturn ??= []).push(t);
-      p.sent++;
-      send({ type: 'user', message: { role: 'user', content: t } });
+      p.send({ type: 'user', message: { role: 'user', content: t } });
       return true;
     };
-    procs.set(id, p);
-    send({ type: 'user', message: { role: 'user', content: text } });
-    let err = '', out = '', failed = false;
-    child.stderr.on('data', (d) => (err = (err + d).slice(-1500)));
-    child.on('error', (e) => (err += e.message));
-    child.stdout.on('data', (d) => {
-      out += d;
-      for (let i; (i = out.indexOf('\n')) >= 0;) {
-        const line = out.slice(0, i);
-        out = out.slice(i + 1);
-        let msg;
-        try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.type === 'control_request') {
-          const reply = (response) => send({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
-          const fail = (e) => send({ type: 'control_response', response: { subtype: 'error', request_id: msg.request_id, error: e.message } });
-          if (msg.request?.subtype === 'can_use_tool') answerTool(id, s, msg.request).then(reply, fail);
-          else fail(new Error(`unsupported control request ${msg.request?.subtype}`));
-        } else if (msg.type === 'user' && msg.isReplay) {
-          p.taken++;
-        } else if (msg.type === 'assistant' && Array.isArray(msg.message?.content)) {
-          const said = msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
-          if (said) p.said = said;
-        } else if (msg.type === 'result') {
-          if (msg.is_error) {
-            failed = true;
-            err = String(msg.result ?? msg.subtype ?? 'error').slice(-1500) + (err ? `\n\n${err}` : '');
-          }
-          // 还有写进去没开始处理的（紧贴着结束发来的），CLI 会接着另起一轮，等它那次 result；一分钟没动静也关
-          if (p.taken >= p.sent || s.stopped) p.ending = true, child.stdin.end();
-          else setTimeout(() => !p.ending && (p.ending = true, child.stdin.end()), 60e3);
-        }
-      }
-    });
-    child.on('close', (code) => { // 进程没能起来（error）时也会触发 close
-      log('cli exit', id.slice(0, 8), code);
-      procs.delete(id);
-      Object.assign(s, { busy_since: undefined, last_end: Date.now() });
-      delete s.midturn;
-      const stopped = s.stopped; // 手机上点了停止：被打断的那一轮不算出错
-      delete s.stopped;
-      finishStatus(id, stopped ? '⏹ 已停止' : code || failed ? '⚠️ 出错了' : '✅ 完成');
-      if ((code || failed) && !stopped) post(`⚠️ 命令行会话出错（退出码 ${code}）\n\n${err}`, s.root, s.dm).catch(() => {});
-      if (s.task && (stopped || code || failed)) s.task.result = stopped ? 'stopped' : 'error';
-      if (s.routine) routineClosed(id, stopped, code || failed ? err : null);
-      if ((code || failed) && !stopped && s.notify) notifyDone(id, '⚠️', '出错了', `${clip(err.trim().split('\n').filter(Boolean).at(-1) ?? '', 200)}（详情在话题里）`);
+    // 这一轮结束（result）：写进去的都处理完了就关输入；还有紧贴着结束写进去、没开始处理的，CLI 会接着另起一轮，等它那次 result；
+    // 一分钟没动静也关
+    p.settle = () => {
+      clearTimeout(p.timer);
+      if (!p.live || p.ending || p.closed || !p.idle) return;
+      if (p.taken >= p.sent + p.inflight.length || s.stopped) return p.end();
+      p.timer = setTimeout(() => p.idle && p.end(), 60e3);
+    };
+    const control = (msg) => {
+      const rid = msg.request_id;
+      if (p.closed || p.answered.has(rid) || p.handled.has(rid)) return;
+      p.handled.add(rid);
+      const reply = (response) => p.send({ type: 'control_response', response: { subtype: 'success', request_id: rid, response } });
+      const fail = (e) => p.send({ type: 'control_response', response: { subtype: 'error', request_id: rid, error: e.message } });
+      if (msg.request?.subtype === 'can_use_tool') answerTool(id, s, msg.request, rid).then(reply, fail);
+      else fail(new Error(`unsupported control request ${msg.request?.subtype}`));
+    };
+    // 输入已经关了、没写进去的话：等这个进程退了用 --resume 接着跑（只在接上之后处理：重放到的上一个转发程序已经处理过）
+    const dropped = (t) => {
+      if (!p.live || typeof t !== 'string') return;
+      const i = s.midturn?.lastIndexOf(t) ?? -1;
+      if (i >= 0) s.midturn.splice(i, 1);
+      const j = s.pending.lastIndexOf(t);
+      if (j >= 0) s.pending.splice(j, 1);
+      running.get(id)?.push(t);
       save();
-      const queued = running.get(id);
-      running.delete(id);
-      if (queued.length) return runCli(id, queued.join('\n\n'), true); // 停止之后才发来的消息照常接着跑
-      if ((stopped || (!code && !failed)) && s.to_desktop) importToDesktop(id).catch((e) => log('desktop import failed', id.slice(0, 8), e.message));
-    });
+    };
+    p.feed = (line) => {
+      const k = line[0], body = line.slice(2);
+      if (k === 'c') return void (p.ending = true);
+      let msg;
+      try { msg = JSON.parse(body); } catch { return; }
+      if (k === 'x') return p.exited(msg ?? {});
+      if (k === 'h') return void Object.assign(p, { pid: msg.pid ?? 0, shimPid: msg.shim ?? 0 });
+      if (k === 'e') return void (p.err = (p.err + msg).slice(-1500));
+      if (k === 'i' || k === 'd') {
+        const j = p.inflight.indexOf(body);
+        if (j >= 0) p.inflight.splice(j, 1);
+        if (k === 'd') return msg.type === 'user' && dropped(msg.message?.content);
+        if (msg.type === 'user') p.sent++;
+        if (msg.type === 'control_response') p.answered.add(msg.response?.request_id);
+        return;
+      }
+      if (k !== 'o') return;
+      if (msg.type === 'control_request') {
+        p.asked.set(msg.request_id, msg);
+        if (p.live) control(msg);
+      } else if (msg.type === 'user' && msg.isReplay) {
+        p.taken++;
+        p.idle = false;
+      } else if (msg.type === 'assistant' && Array.isArray(msg.message?.content)) {
+        const said = msg.message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+        if (said) p.said = said;
+      } else if (msg.type === 'result') {
+        if (msg.is_error) {
+          p.failed = true;
+          p.err = String(msg.result ?? msg.subtype ?? 'error').slice(-1500) + (p.err ? `\n\n${p.err}` : '');
+        }
+        p.idle = true;
+        p.settle();
+      }
+    };
+    // 重放完了：没答的审批发到手机（原来那张卡片还在就接着用它），该关输入的关掉，接回来之前排着的消息能写进去就写进去
+    p.goLive = () => {
+      if (p.live || p.closed) return;
+      p.live = true;
+      for (const msg of p.asked.values()) control(msg);
+      p.settle();
+      const q = running.get(id);
+      while (q?.length && p.inject(q[0])) q.shift();
+      save();
+    };
+    // 进程退了（记录里的 x）。interrupted：被打断了，没正常收尾——中转进程也没了、没留下退出记录，
+    // 或者转发程序不在的时候 claude 被信号杀掉（不是手机上点的停止）；例行任务按被打断重跑。
+    // 转发程序在的时候被信号杀掉的照出错报（例行任务报一次「没跑成」，不重跑：同样的原因再跑多半还是被杀，免得一直重跑）
+    p.exited = (info, interrupted = false) => {
+      if (p.closed) return;
+      p.closed = true;
+      clearInterval(p.tail);
+      clearTimeout(p.timer);
+      p.conn?.destroy();
+      p.conn = null;
+      const why = info.error ?? (info.signal && `claude 进程被 ${info.signal} 信号结束了`);
+      const err = why ? `${why}${p.err ? `\n\n${p.err}` : ''}` : p.err;
+      cliClosed(id, p, info.code ?? null, p.failed || !!why, err, interrupted || (!!info.signal && !s.stopped && !p.live));
+    };
+    return p;
+  }
+
+  // 接上中转进程：先把记录文件从头读一遍（重放），再每 200 毫秒读新写的；写经 socket 发过去，断了就重连。
+  // adopt：转发程序刚起来、接上一个转发程序留下的会话
+  function attachShim(id, p, adopt) {
+    const sh = p.sh;
+    const read = () => { // 只读完整的行（按字节找换行，不会把一个汉字劈成两半）
+      if (p.closed) return;
+      let fd;
+      try { fd = fs.openSync(sh.log, 'r'); } catch { return; }
+      try {
+        const size = fs.fstatSync(fd).size;
+        if (size <= p.offset) return;
+        const buf = Buffer.alloc(size - p.offset);
+        fs.readSync(fd, buf, 0, buf.length, p.offset);
+        const end = buf.lastIndexOf(10);
+        if (end < 0) return;
+        p.offset += end + 1;
+        for (const line of buf.toString('utf8', 0, end).split('\n')) if (line && !p.closed) p.feed(line);
+      } finally { fs.closeSync(fd); }
+    };
+    read();
+    if (p.closed) return;
+    // 中转进程还在就接上（socket 还没开好的话下面会重连；电脑重启后进程号被别人占了的，连不上 10 秒后按中断处理）
+    const shimPid = p.shimPid || sh.pid;
+    if (adopt && !(shimPid && pidAlive(shimPid))) {
+      read(); // 中转进程刚好在这一刻退出时，x 可能刚写进去
+      if (!p.closed) p.exited({ code: null, error: '会话进程不见了（电脑重启过，或进程被杀了），这一轮没做完' }, true);
+      return;
+    }
+    p.goLive();
+    p.tail = setInterval(read, 200);
+    let fails = 0;
+    const connect = () => {
+      if (p.closed) return;
+      const c = net.connect(sh.sock);
+      c.on('connect', () => {
+        fails = 0;
+        p.conn = c;
+        for (const l of p.outbox.splice(0)) c.write(l);
+      });
+      c.on('error', () => {});
+      c.on('close', () => {
+        if (p.conn === c) p.conn = null;
+        if (p.closed) return;
+        // 中转进程退了的话记录里马上有 x，读到就收尾；刚起还没开 socket 时连不上，过一会儿再连。一直连不上又没有 x：中转进程被杀了
+        read();
+        if (p.closed) return;
+        if (++fails > 50) return p.exited({ code: null, error: '中转进程不见了，这一轮没做完' }, adopt);
+        setTimeout(connect, 200);
+      });
+    };
+    connect();
+  }
+
+  // 命令行会话的进程退了（中转进程报的退出码；或中转进程也没了）：卡片收尾、出错报到话题和私聊、排着的消息接着续跑、导入桌面
+  function cliClosed(id, p, code, failed, err, interrupted) {
+    log('cli exit', id.slice(0, 8), code, interrupted ? 'interrupted' : '');
+    if (procs.get(id) === p) procs.delete(id);
+    const s = session(id);
+    if (s.shim?.log === p.sh.log) delete s.shim;
+    fs.rmSync(p.sh.log, { force: true });
+    fs.rmSync(p.sh.sock, { force: true });
+    Object.assign(s, { busy_since: undefined, last_end: Date.now() });
+    delete s.midturn;
+    const stopped = s.stopped; // 手机上点了停止：被打断的那一轮不算出错
+    delete s.stopped;
+    const queued = running.get(id) ?? [];
+    running.delete(id);
+    delete s.queued;
+    if (s.routine && interrupted && !stopped) { // 例行任务被打断：和以前一样，到点跑的当天重跑、审查的把范围放回去重审
+      finishStatus(id, '⏹ 被打断了，会重跑');
+      recoverRoutine(id, s);
+      return save();
+    }
+    finishStatus(id, stopped ? '⏹ 已停止' : code || failed ? '⚠️ 出错了' : '✅ 完成');
+    if ((code || failed) && !stopped) post(`⚠️ 命令行会话出错（${code == null ? '进程中断' : `退出码 ${code}`}）\n\n${err}`, s.root, s.dm).catch(() => {});
+    if (s.task && (stopped || code || failed)) s.task.result = stopped ? 'stopped' : 'error';
+    if (s.routine) routineClosed(id, stopped, code || failed ? err : null);
+    if ((code || failed) && !stopped && s.notify) notifyDone(id, '⚠️', '出错了', `${clip(err.trim().split('\n').filter(Boolean).at(-1) ?? '', 200)}（详情在话题里）`);
+    save();
+    if (queued.length) return runCli(id, queued.join('\n\n'), true); // 停止之后才发来的消息照常接着跑
+    if ((stopped || (!code && !failed)) && s.to_desktop) importToDesktop(id).catch((e) => log('desktop import failed', id.slice(0, 8), e.message));
+  }
+
+  // 转发程序（重新）启动：上一个转发程序起的命令行会话接回来。中转进程还活着的接着跑（审批、插话、停止、卡片照常）；
+  // 转发程序不在时已经退了的，按记录照常收尾（报错、通知、续跑排着的消息）；中转进程也没了、又没留下退出记录的
+  // （电脑重启过），按被打断处理。要在开始读钩子事件、连飞书、接 approve.sock 的请求之前做完（这些都要知道哪些会话在跑）
+  function adoptShims() {
+    // 没人认领、一天前的记录文件（状态丢过之类）清掉；socket 不动，还活着的中转进程没人连会自己收尾
+    const known = new Set(Object.values(state.sessions).map((s) => s.shim?.log).filter(Boolean));
+    try {
+      for (const f of fs.readdirSync(RUN)) {
+        const p = path.join(RUN, f);
+        if (f.endsWith('.log') && !known.has(p) && Date.now() - fs.statSync(p).mtimeMs > 86400e3) fs.rmSync(p, { force: true });
+      }
+    } catch {}
+    for (const [id, s] of Object.entries(state.sessions)) {
+      if (!s.shim?.log || running.has(id)) continue;
+      try {
+        const p = shimProc(id, s.shim);
+        running.set(id, (s.queued ??= []));
+        procs.set(id, p);
+        log('adopt', id.slice(0, 8), path.basename(s.shim.log));
+        attachShim(id, p, true);
+        if (!p.closed && s.routine) armRoutine(id);
+      } catch (e) { // 一个会话接不回来不能让整个转发程序起不来（KeepAlive 下会一直重启）
+        log('adopt failed', id.slice(0, 8), e.message);
+        procs.delete(id);
+        running.delete(id);
+        delete s.shim;
+      }
+    }
   }
 
   // 手机开的会话，命令行跑完第一轮后导入桌面版：先在对话文件末尾写上标题（和 /rename 写的是同一种记录），
@@ -818,8 +1132,10 @@ async function run() {
     running.get(id)?.splice(0);
     for (const e of [...prompts.values()]) if (e.sid === id) e.cancel('你在手机上点了停止');
     p.send({ type: 'control_request', request_id: `stop-${Date.now()}`, request: { subtype: 'interrupt' } });
-    setTimeout(() => procs.get(id) === p && p.child.kill('SIGTERM'), 10e3);
+    p.settle(); // 已经停在两轮之间的，直接关输入
+    p.kill(10e3); // 计时放在中转进程里：这 10 秒里转发程序重启也照样结束
     log('stop', id.slice(0, 8));
+    save();
     refreshStatus(id);
     return true;
   }
@@ -832,9 +1148,25 @@ async function run() {
   const asking = new Map(); // 私聊 chat_id 或话题 root -> 队尾（排队用）
   const waiting = new Map(); // 私聊 chat_id 或话题 root -> 眼前这个请求 { text(回复), cancel(原因) }
   const prompts = new Map(); // 请求 id -> 同一个请求 { click(按钮值, 表单值) }，按钮回调按 id 找
+  const openAsks = () => (state.open_asks ??= {}); // 发在手机上、还没答的卡片（ask 的 reuse → { id, msg, mirror }），重启后接着用
+  const reclaimed = new Set(); // 这次启动后又问到的（重启后没再问到的旧卡片，过一会儿标成已失效）
   const clip = (t, n = 3000) => (t.length > n ? t.slice(0, n) + `\n…（共 ${t.length} 字，只显示前 ${n} 字）` : t);
   const chunks = (md) => (md.length <= 12000 ? [md] : Array.from({ length: Math.ceil(md.length / 12000) }, (_, i) => md.slice(i * 12000, (i + 1) * 12000)));
   const approveMins = () => Number(cfg.approve_timeout_minutes) || undefined; // 不配或 0：一直等
+  const claimAsk = (k) => (reclaimed.add(k), k);
+  // 钩子来的请求没有 id：按会话 + 工具 + 参数认（参数可能很长，存哈希）
+  const callHash = (tool, input) => crypto.createHash('sha256').update(`${tool}\n${canon(input ?? {})}`).digest('hex').slice(0, 16);
+  // 重启前发出去、重启后过了一会儿也没再问到的卡片（会话已经不等了）：改成已失效，免得看着还能点
+  function sweepAsks() {
+    for (const [k, a] of Object.entries(openAsks())) {
+      if (reclaimed.has(k)) continue;
+      delete openAsks()[k];
+      const text = `${a.shown ?? ''}\n\n⏹ 转发程序重启后这个请求已经不在了（那边要是还在等，会另发一张）`;
+      patch(a.msg, text);
+      if (a.mirror) patch(a.mirror, `**${a.mirror_title ?? ''}**\n\n${text}`);
+    }
+    save();
+  }
   function enqueue(key, fn) {
     const turn = (asking.get(key) ?? Promise.resolve()).then(fn);
     asking.set(key, turn.catch(() => {}));
@@ -844,26 +1176,40 @@ async function run() {
   // spec: body 正文；hint(分钟) 怎么回；controls(id) 按钮或表单；fromText / fromClick 把回复变成结果，
   // 看不懂时返回一句提示（字符串）；summary(结果) 答完后卡片上显示什么；
   // onTimeout(分钟) 到点的结果（null 表示手机不表态）；signal 中止时（电脑上已处理、开了新任务）按 onAbort(原因) 收尾
+  // reuse：这个请求的标识（会话 + 审批请求 id，钩子来的按会话 + 工具 + 参数）。发出去的卡片记在 state.open_asks[reuse]，
+  // 转发程序重启后同一个请求再问到这里（中转进程重放、钩子重连再问），不另发，接着用手机上原来那张（按钮 id 不变）
   async function ask(key, root, chat, spec) {
     if (spec.signal?.aborted) return spec.onAbort(spec.signal.reason);
-    const id = crypto.randomUUID().slice(0, 8);
+    const prev = spec.reuse && openAsks()[spec.reuse];
+    const id = prev?.id ?? crypto.randomUUID().slice(0, 8);
     const mins = approveMins();
     const parts = chunks(`${spec.body}\n\n${spec.hint(mins)}`); // 卡片有长度上限，长的分几条，按钮放最后一条
-    for (const p of parts.slice(0, -1)) await post(p, root, chat);
-    let msg;
-    try {
-      msg = await postCard([{ tag: 'markdown', content: parts.at(-1) }, ...spec.controls(id)], root, chat);
-    } catch (e) { // 卡片结构被拒时退回纯文字，回文字照样能答
-      log('button card failed', e.message);
-      msg = await post(parts.at(-1), root, chat);
-    }
     const shown = parts.length === 1 ? spec.body : '（内容见上面几条）';
-    // 秘书派的活在话题里问你时，私聊也发一张同样带按钮的卡片，在哪边点都行。私聊里直接打的字是发给秘书的；
-    // 长按这张卡片回复的字算回这个任务（记进 dm_cards，见「私聊里引用回复任务」）
-    const mirror = spec.mirror && postCard([
-      { tag: 'markdown', content: `⏸ **${spec.mirror.title}** 在等你\n\n${clip(spec.body, 6000)}\n\n在这里点按钮，或长按这条回复文字；不引用直接打字是发给秘书的。` },
-      ...spec.controls(id),
-    ], null, spec.mirror.chat).then((m) => (spec.sid && rememberCard(m, spec.sid), m), (e) => (log('mirror card failed', e.message), null));
+    let msg, mirror;
+    if (prev) {
+      ({ msg } = prev);
+      mirror = prev.mirror && Promise.resolve(prev.mirror);
+      log('ask reattached', id);
+    } else {
+      for (const p of parts.slice(0, -1)) await post(p, root, chat);
+      try {
+        msg = await postCard([{ tag: 'markdown', content: parts.at(-1) }, ...spec.controls(id)], root, chat);
+      } catch (e) { // 卡片结构被拒时退回纯文字，回文字照样能答
+        log('button card failed', e.message);
+        msg = await post(parts.at(-1), root, chat);
+      }
+      // 秘书派的活在话题里问你时，私聊也发一张同样带按钮的卡片，在哪边点都行。私聊里直接打的字是发给秘书的；
+      // 长按这张卡片回复的字算回这个任务（记进 dm_cards，见「私聊里引用回复任务」）
+      mirror = spec.mirror && postCard([
+        { tag: 'markdown', content: `⏸ **${spec.mirror.title}** 在等你\n\n${clip(spec.body, 6000)}\n\n在这里点按钮，或长按这条回复文字；不引用直接打字是发给秘书的。` },
+        ...spec.controls(id),
+      ], null, spec.mirror.chat).then((m) => (spec.sid && rememberCard(m, spec.sid), m), (e) => (log('mirror card failed', e.message), null));
+      if (spec.reuse) {
+        const rec = (openAsks()[spec.reuse] = { id, msg, shown: clip(shown, 3000), mirror_title: spec.mirror?.title, at: Date.now() });
+        save();
+        mirror?.then((m) => m && openAsks()[spec.reuse] === rec && ((rec.mirror = m), save()));
+      }
+    }
     return new Promise((resolve) => {
       let timer;
       // 答完把两张卡片都改成结果；clicked 是点按钮的那张，由回调响应去改
@@ -872,11 +1218,12 @@ async function run() {
         spec.signal?.removeEventListener('abort', aborted);
         waiting.delete(key);
         prompts.delete(id);
+        if (spec.reuse && openAsks()[spec.reuse]?.id === id) delete openAsks()[spec.reuse], save();
         resolve(result);
         nudgeStatus(key);
         const text = `${shown}\n\n${note}`;
         if (msg !== clicked) patch(msg, text);
-        mirror?.then((m) => m && m !== clicked && patch(m, `**${spec.mirror.title}**\n\n${text}`));
+        mirror?.then((m) => m && m !== clicked && patch(m, `**${spec.mirror?.title ?? prev?.mirror_title ?? ''}**\n\n${text}`));
         return text;
       };
       const cancel = (reason) => finish(spec.onAbort(reason), `⏹ ${reason}`);
@@ -1000,7 +1347,7 @@ async function run() {
   };
 
   // 转发程序自己起的会话（stdio）：返回 { behavior: 'allow', updatedInput } 或 { behavior: 'deny', message }
-  async function answerTool(id, s, req) {
+  async function answerTool(id, s, req, rid) {
     const key = s.dm ?? s.root;
     const root = s.dm ? null : s.root;
     const input = req.input ?? {};
@@ -1012,9 +1359,10 @@ async function run() {
       : '例行任务没有人看着，要确认的操作一律不做。换只读的办法，或者跳过这一步并在结果里写明哪项没查成。' };
     if (takeAsked(id, req.tool_name, input)) return log('grant used', id.slice(0, 8)), { behavior: 'allow', updatedInput: input };
     const mirror = mirrorOf(s);
-    if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id, mirror }));
+    const reuse = rid ? claimAsk(`${id}:${rid}`) : undefined;
+    if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id, mirror, reuse }));
     if (isImageRead(req.tool_name, input)) return { behavior: 'allow', updatedInput: input };
-    const d = await enqueue(key, () => ask(key, root, s.dm, { ...approvalSpec({ tool_name: req.tool_name, tool_input: input }, false, procs.get(id)?.said), sid: id, mirror }));
+    const d = await enqueue(key, () => ask(key, root, s.dm, { ...approvalSpec({ tool_name: req.tool_name, tool_input: input }, false, procs.get(id)?.said), sid: id, mirror, reuse }));
     return d.behavior === 'allow' ? { behavior: 'allow', updatedInput: input } : d;
   }
 
@@ -1072,7 +1420,8 @@ async function run() {
     const q = req.tool_name === 'AskUserQuestion' && questionSpec(req.tool_input ?? {});
     const spec = q ? { ...q, hint: (mins) => `${q.hint(mins)}电脑上也在问，哪边先答算哪边。`, onTimeout: () => null, onAbort: () => null } : approvalSpec(req, true, lastSaid(s));
     try {
-      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...spec, signal: ctl.signal, mirror: mirrorOf(s), sid: req.session_id }));
+      const reuse = claimAsk(`hook:${req.session_id}:${callHash(req.tool_name, req.tool_input)}`);
+      return await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...spec, signal: ctl.signal, mirror: mirrorOf(s), sid: req.session_id, reuse }));
     } finally { stop(); }
   }
 
@@ -1143,7 +1492,8 @@ async function run() {
     log('denied', req.session_id.slice(0, 8), req.tool_name, String(req.reason ?? '').slice(0, 60));
     const ctl = new AbortController();
     gone.addEventListener('abort', () => ctl.abort('会话那边已经不等了'));
-    const r = await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...deniedSpec(req), signal: ctl.signal, mirror: mirrorOf(s), sid: req.session_id }));
+    const reuse = claimAsk(`denied:${req.session_id}:${callHash(req.tool_name, req.tool_input)}`);
+    const r = await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...deniedSpec(req), signal: ctl.signal, mirror: mirrorOf(s), sid: req.session_id, reuse }));
     if (r?.behavior !== 'allow') return null;
     addGrant(req.session_id, req.tool_name, req.tool_input);
     log('grant', req.session_id.slice(0, 8), req.tool_name);
@@ -1300,6 +1650,17 @@ async function run() {
     status.set(id, st);
     st.msg = postCard(statusCard(id, st), s.dm ? null : s.root, s.dm).catch(() => null);
     st.timer = setInterval(() => refreshStatus(id), 15e3);
+    // 卡片记进 state：转发程序重启后接着刷新同一张（restoreCards）
+    st.msg.then((msg) => msg && status.get(id) === st && ((s.card = { msg, key, start: st.start, offset: st.offset }), save()));
+  }
+  function restoreCards() {
+    for (const [id, s] of Object.entries(state.sessions)) {
+      const c = s.card;
+      if (!c?.msg || status.has(id)) continue;
+      const st = { key: c.key, start: c.start, offset: c.offset, msg: Promise.resolve(c.msg) };
+      status.set(id, st);
+      st.timer = setInterval(() => refreshStatus(id), 15e3);
+    }
   }
   async function refreshStatus(id) {
     const st = status.get(id);
@@ -1320,6 +1681,7 @@ async function run() {
     if (!st) return;
     status.delete(id);
     clearInterval(st.timer);
+    if (state.sessions[id]?.card) delete state.sessions[id].card, save();
     const msg = await st.msg;
     if (msg) await patchCard(msg, statusCard(id, st, done));
   }
@@ -1452,7 +1814,7 @@ async function run() {
     for (const [id, s] of Object.entries(state.sessions)) {
       const key = s.dm ?? s.root;
       const live = s.socket && alive(s.socket);
-      const pid = procs.get(id)?.child?.pid ?? (live ? Number(path.basename(s.socket, '.sock')) || 0 : 0);
+      const pid = procs.get(id)?.pid || (live ? Number(path.basename(s.socket, '.sock')) || 0 : 0);
       const last = Math.max(s.last_end ?? 0, s.busy_since ? lastActivity(s.transcript) : 0);
       // 钩子报了开始、还没报结束：进程活着，或对话 10 分钟内还在写（从私聊点开到桌面的会话，收件地址可能还是旧的）
       const turn = running.has(id) || (s.busy_since && (live || now - last < 10 * 60e3));
@@ -2397,14 +2759,21 @@ async function run() {
     // 话题开出来了就一定要跑起来：后面贴提示词失败不算，免得下一轮又开一个
     for (const part of chunks(text)) await post(part, root).catch((e) => log('routine prompt post failed', e.message));
     runCli(id, text, false);
+    armRoutine(id);
+    log('routine start', r.name, id.slice(0, 8), extra.head ? extra.head.slice(0, 10) : '');
+    return id;
+  }
+
+  // 跑太久就停：从开始算 max_minutes（转发程序重启后接回来的按剩下的时间算）
+  function armRoutine(id) {
+    clearTimeout(routineTimers.get(id));
+    const rt = session(id).routine;
     routineTimers.set(id, setTimeout(() => {
       routineTimers.delete(id);
       if (!running.has(id)) return;
       session(id).routine.timeout = true;
       stopTask(id);
-    }, session(id).routine.max));
-    log('routine start', r.name, id.slice(0, 8), extra.head ? extra.head.slice(0, 10) : '');
-    return id;
+    }, Math.max(0, rt.started + rt.max - Date.now())));
   }
 
   // 私聊发结果：最后一条回复（所有工具调用之后的文字）；有「【私聊】」一行时只发它后面的（前面的详细意见留在话题里）
@@ -2490,20 +2859,26 @@ async function run() {
       if (!rt.sent && !rt.sending && !rt.held) routineFailed(id, why ?? '跑完了，但最后没有文字结果');
     }, why ? 0 : 5000);
   }
-  // 转发程序重启（部署、崩溃）会杀掉正在跑的例行任务：到点跑的今天重跑一次，审查的把没审完的范围放回去重审
+  // 例行任务被打断（电脑重启、进程被杀；以前转发程序重启也会）：到点跑的今天重跑一次，审查的把没审完的范围放回去重审。
+  // 挂在中转进程上的（s.shim）不在这里管：还活着的由 adoptShims 接回来接着跑，没了的由它按被打断交给 recoverRoutine
   function recoverRoutines() {
     for (const [id, s] of Object.entries(state.sessions)) {
       const rt = s.routine;
       if (rt?.held) { delete rt.sending; continue; } // 跑完了、结果压着等免打扰过去：不算被打断，flushHeld 会发
-      if (!rt || rt.sent || Date.now() - rt.started > 12 * 3600e3) continue;
-      delete rt.sending;
-      const st = state.routines?.[rt.name];
-      Object.assign(rt, { sent: true, result: 'error', line: '被转发程序重启打断，已重跑' });
-      if (st && rt.base && st.head === rt.head) st.head = rt.base;
-      else if (st && rt.day && st.day === rt.day) st.day = rt.prev ?? null;
-      log('routine interrupted, will rerun', rt.name, id.slice(0, 8));
+      if (!rt || rt.sent || s.shim || Date.now() - rt.started > 12 * 3600e3) continue;
+      recoverRoutine(id, s);
     }
     save();
+  }
+  function recoverRoutine(id, s) {
+    const rt = s.routine;
+    delete rt.sending;
+    if (rt.sent || Date.now() - rt.started > 12 * 3600e3) return;
+    const st = state.routines?.[rt.name];
+    Object.assign(rt, { sent: true, result: 'error', line: '被打断了，已重跑' });
+    if (st && rt.base && st.head === rt.head) st.head = rt.base;
+    else if (st && rt.day && st.day === rt.day) st.day = rt.prev ?? null;
+    log('routine interrupted, will rerun', rt.name, id.slice(0, 8));
   }
 
   // develop 这类分支：定时 fetch，有作者不是自己的新提交就开一个审查会话。审到哪个提交记在 head（第一次启用时取当时的，不审历史）；
@@ -2591,7 +2966,11 @@ async function run() {
       }
     } finally { routineTicking = false; }
   }
+  // 启动时接回上一个转发程序留下的会话。都是同步做完的：在这之后才开始处理钩子事件、飞书消息、approve.sock / tasks.sock 的请求
+  restoreCards();
   recoverRoutines();
+  adoptShims();
+  setTimeout(sweepAsks, 90e3);
   setInterval(() => tickRoutines(), 30e3);
   setTimeout(() => tickRoutines(), 10e3);
 
