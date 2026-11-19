@@ -429,7 +429,14 @@ async function run() {
       finishStatus(ev.session_id, s.stopped ? '⏹ 已停止' : '⏹ 会话已结束');
     }
 
-    if (ev.event === 'UserPromptSubmit' && ev.prompt) s.busy_since ??= ev.at ?? Date.now(); // 大屏：这一轮从什么时候开始
+    if (ev.event === 'UserPromptSubmit' && ev.prompt) {
+      // 后台命令、Monitor 事件触发的自动一轮（<task-notification>）记下来：结束时没写汇报就不往私聊报。
+      // 自动一轮里你又插了话，这一轮就算你的
+      const isAuto = /^\s*<task-notification>/.test(ev.prompt) && !s.pending.some((t) => ev.prompt.includes(t));
+      if (!isAuto) s.turn_auto = false;
+      else if (!s.busy_since) s.turn_auto = true;
+      s.busy_since ??= ev.at ?? Date.now(); // 大屏：这一轮从什么时候开始
+    }
     if (ev.event === 'Stop') Object.assign(s, { busy_since: undefined, last_end: ev.at ?? Date.now() });
     if (ev.event === 'UserPromptSubmit' && ev.prompt) {
       const i = s.pending.findIndex((t) => ev.prompt.includes(t));
@@ -478,7 +485,11 @@ async function run() {
       // 一轮结束不等于活干完了：出了方案等你拍板也是一轮结束。汇报里在等你的，标成「等你回复」
       const forYou = WAITS_FOR_YOU.test(report ?? '');
       if (s.task && !s.stopped) Object.assign(s.task, { result: forYou ? 'waiting' : 'done', ...(report && { report: report.slice(0, 300) }) });
-      if (s.notify && !s.stopped && texts.length) {
+      // 自动一轮（等后台测试时每来一个 Monitor 事件就是一轮，多半只说「还在等」）没写汇报的不报；同一句汇报不重复报
+      const quiet = (s.turn_auto && !report) || (report && report === s.notified);
+      s.turn_auto = false;
+      if (s.notify && !s.stopped && texts.length && !quiet) {
+        if (report) s.notified = report;
         const took_ = took ? ` · 用时 ${duration(Date.now() - took)}` : '';
         notifyDone(ev.session_id, forYou ? '⏸' : '✅', forYou ? `等你回复${took_}（在话题里回复就接着做）` : `这一轮结束${took_}`, report ?? clip(md.replace(/\s+/g, ' '), 200));
         if (!s.task) s.notify = false; // 电脑上开着的会话：只报秘书递话的那一轮
@@ -1854,7 +1865,8 @@ async function run() {
   // ───── 补收 ─────
   // 长连接断了又连上的那段时间里，飞书推过来的消息会丢，事后也不重推（11-19 10:34 丢过一条话题回复）。
   // 连上（含重连）后、以及每 5 分钟，把群里和私聊最近 30 分钟本人发的消息列一遍，没处理过的按时间顺序补上。
-  // 处理过的消息 id 存在 state.handled（留 6 小时），重启后也不会重放；catch_from 之前的不补（功能上线前的消息）
+  // 处理过的消息 id 存在 state.handled（留 24 小时），重启后也不会重放；catch_from 之前的不补（功能上线前的消息）。
+  // 飞书自己过一阵也可能重推（11-19 那条一小时后又推来了）：长连接收到的消息发出超过 2 分钟的，同样按晚到处理
   const seen = new Set();
   const CATCH_WINDOW = 30 * 60e3, CATCH_SETTLE = 20e3;
   if (!state.catch_from) state.catch_from = Date.now();
@@ -1873,7 +1885,7 @@ async function run() {
     return (catching ??= (async () => {
       try {
         const now = Date.now();
-        for (const [id, t] of Object.entries(state.handled)) if (now - t > 6 * 3600e3) delete state.handled[id];
+        for (const [id, t] of Object.entries(state.handled)) if (now - t > 24 * 3600e3) delete state.handled[id]; // 飞书自己也会隔一小时以上重推
         const from = Math.max(state.catch_from, now - CATCH_WINDOW);
         const missed = [];
         for (const [chat, type] of [[cfg.chat_id, 'group'], [state.dm?.chat_id, 'p2p']]) {
@@ -1917,7 +1929,9 @@ async function run() {
       // 收到什么先记一笔（不记内容），丢消息时才查得出是飞书没推还是这里过滤掉了
       log('recv', m.chat_type, m.message_type, m.message_id, m.root_id ? 'in ' + m.root_id : '');
       if (!claim(m.message_id)) return; // 飞书偶尔重复推送；补收已经处理过的也跳过
-      onPhoneMessage(data).catch((e) => log('phone message failed', e.message));
+      const late = Date.now() - Number(m.create_time) > 120e3; // 断线后飞书隔了很久才重推的
+      if (late) log('late redelivered', m.message_id, Math.round((Date.now() - Number(m.create_time)) / 60e3) + ' min');
+      onPhoneMessage({ ...data, late }).catch((e) => log('phone message failed', e.message));
     },
     // 卡片按钮（审批、选择题）。要在飞书开发者后台「事件与回调 → 回调配置」用长连接订阅 card.action.trigger。
     // 返回值就是给飞书的回调响应：弹个提示，答完的卡片换成去掉按钮的样子
