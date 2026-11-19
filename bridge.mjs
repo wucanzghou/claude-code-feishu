@@ -45,7 +45,7 @@ const TASK_SOCK = path.join(HOME, 'tasks.sock');
 const SECRETARY_NOTE = [
   '你是用户的秘书兼负责人。用户在手机飞书私聊里和你对话，看不到电脑屏幕，只要结果。',
   '小事（几次工具调用就能查清、答清的）自己做；大活（耗时、多步骤、要改代码、要排查的）用 mcp__feishu__start_task 派给一个新的 Claude 会话，它在飞书群里单独开一个话题做，过程都留在那个话题里。',
-  '派活说明要自成一体：干活的会话看不到这里的对话。写清目标、背景、涉及的文件或系统、完成标准和限制（只读还是可以改代码；除非用户明确要求，不 commit、不 push、不改生产数据、不对外发消息）。会改文件的任务 edits_code 填 true，同一时间只能有一个改代码的任务在跑。',
+  '派活说明要自成一体：干活的会话看不到这里的对话。写清目标、背景、涉及的文件或系统、完成标准和限制（只读还是可以改代码；除非用户明确要求，不 commit、不 push、不改生产数据、不对外发消息）。会改文件的任务 edits_code 填 true。改代码的任务可以同时派好几个；它们改到同一处打架时，再让它们各自建 git worktree。',
   '派活和追加指示都要用户在私聊里点按钮确认才执行。调完工具就简短告诉用户派了什么，结束这一轮，不要等结果；任务做完、出错或等用户确认时，转发程序会直接通知用户。',
   '用户问进展时用 list_tasks / task_detail 查；给任务补充指示用 send_to_task（也能递给电脑上开着的桌面会话）；要停用 stop_task。',
   '汇报照实说：没查到就说没查到，没做完就说没做完，不要编。说话简短口语化，像发微信，少用表格和长清单。',
@@ -62,7 +62,7 @@ const TASK_TOOLS = [
       properties: {
         title: { type: 'string', description: '话题标题，20 字以内' },
         brief: { type: 'string', description: '完整的派活说明：目标、背景、涉及的文件或系统、完成标准、限制。干活的会话只看得到这段话' },
-        edits_code: { type: 'boolean', description: '会不会改文件或代码（同一时间只能有一个改代码的任务在跑）' },
+        edits_code: { type: 'boolean', description: '会不会改文件或代码' },
         cwd: { type: 'string', description: '工作目录：配置里的项目别名或绝对路径；不填用默认目录' },
       },
       required: ['title', 'brief', 'edits_code'],
@@ -1185,12 +1185,10 @@ async function run() {
     return { text: `${head}${st ? `\n\n现在：\n${statusMd(id, st)}` : ''}\n\n最近一轮的回复：\n${texts ? clip(texts, 6000) : '（还没有）'}` };
   }
 
-  // 同时在跑的任务有上限，改代码的一次只跑一个（大家共用一个工作目录）
-  function whyBusy(edits) {
+  // 同时在跑的任务有上限（改代码的也可以同时跑好几个，打架了再让它们各自建 worktree）
+  function whyBusy() {
     const live = tasks().filter(([id]) => running.has(id));
     if (live.length >= maxTasks()) return `已经有 ${live.length} 个任务在跑（上限 ${maxTasks()}）：${live.map(([, s]) => `「${s.title}」`).join('、')}，等做完或停掉一个再派`;
-    const editing = live.find(([, s]) => s.task.edits);
-    if (edits && editing) return `改代码的任务一次只跑一个，「${editing[1].title}」还在跑，等它做完或停掉再派`;
     return null;
   }
 
@@ -1209,7 +1207,7 @@ async function run() {
     if (!cwd || !fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) return { error: `没有这个目录或别名：${where}` };
     if (!dmChat()) return { error: '用户还没私聊过机器人，没地方发确认' };
     const d = { kind: 'start', title, brief, cwd, edits: a.edits_code === true, by: state.dm?.session, at: Date.now() };
-    const busy = whyBusy(d.edits);
+    const busy = whyBusy();
     if (busy) return { error: busy };
     if (cfg.dispatch_confirm === false) {
       const id = await startDispatched(d);
@@ -1241,7 +1239,7 @@ async function run() {
     const [id, s] = hit;
     const message = String(a.message ?? '').trim();
     if (!message) return { error: 'message 不能为空' };
-    const busy = s.task && !running.has(id) && whyBusy(s.task.edits); // 没在跑的任务续上要起进程，也占名额
+    const busy = s.task && !running.has(id) && whyBusy(); // 没在跑的任务续上要起进程，也占名额
     if (busy) return { error: busy };
     const d = { kind: 'send', sid: id, title: titleOfSession(s), message, at: Date.now() };
     if (cfg.dispatch_confirm === false) {
@@ -1275,7 +1273,7 @@ async function run() {
     if (!d) return { toast: { type: 'info', content: '这个请求已经处理过了' } };
     const yes = v.a === 'dispatch' || v.a === 'send';
     const target = d.kind === 'send' && state.sessions[d.sid];
-    const busy = yes && (d.kind === 'start' ? whyBusy(d.edits) : target?.task && !running.has(d.sid) ? whyBusy(target.task.edits) : null);
+    const busy = yes && (d.kind === 'start' || (target?.task && !running.has(d.sid)) ? whyBusy() : null);
     if (busy) {
       post(`⏸ ${busy}`, null, dmChat()).catch(() => {});
       return { toast: { type: 'warning', content: '现在派不了，原因发在私聊里' } };
