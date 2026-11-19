@@ -1093,7 +1093,7 @@ async function run() {
   // 在群里开话题，一个话题一个干活的会话（task）。派活、递话默认要你在私聊点按钮才执行（dispatch_confirm: false 可关）。
   // 秘书派的活、递的话做完一轮、出错、等你确认时，私聊收一条通知（notify）；你自己在话题或电脑上接着聊之后就不再报
   const secretaryOn = () => cfg.secretary !== false;
-  const maxTasks = () => Number(cfg.max_tasks) || 3;
+  const maxTasks = () => Number(cfg.max_tasks) || 0; // 0 = 不限
   const dmChat = () => state.dm?.chat_id;
   const tasks = () => Object.entries(state.sessions).filter(([, s]) => s.task);
   const askKey = () => crypto.randomUUID().slice(0, 8);
@@ -1131,7 +1131,7 @@ async function run() {
     const desk = Object.entries(state.sessions).filter(([id, s]) => liveDesk(id, s))
       .map(([id, s]) => `- [${id.slice(0, 8)}] ${titleOfSession(s)} · ${s.desktop ? '桌面' : '终端'} · ${tilde(s.cwd ?? '')}`);
     return [
-      `派出去的任务（最近 7 天；同时最多 ${maxTasks()} 个在跑）：`, ...(mine.length ? mine : ['（没有）']),
+      `派出去的任务（最近 7 天${maxTasks() ? `；同时最多 ${maxTasks()} 个在跑` : ''}）：`, ...(mine.length ? mine : ['（没有）']),
       ...(asks.length ? ['', '等你确认的：', ...asks] : []),
       ...(desk.length ? ['', '电脑上开着的会话：', ...desk] : []),
     ].join('\n');
@@ -1185,10 +1185,10 @@ async function run() {
     return { text: `${head}${st ? `\n\n现在：\n${statusMd(id, st)}` : ''}\n\n最近一轮的回复：\n${texts ? clip(texts, 6000) : '（还没有）'}` };
   }
 
-  // 同时在跑的任务有上限（改代码的也可以同时跑好几个，打架了再让它们各自建 worktree）
+  // 默认不限同时跑几个（改代码的也一样，打架了再让它们各自建 worktree）；配了 max_tasks 才按它拦
   function whyBusy() {
     const live = tasks().filter(([id]) => running.has(id));
-    if (live.length >= maxTasks()) return `已经有 ${live.length} 个任务在跑（上限 ${maxTasks()}）：${live.map(([, s]) => `「${s.title}」`).join('、')}，等做完或停掉一个再派`;
+    if (maxTasks() && live.length >= maxTasks()) return `已经有 ${live.length} 个任务在跑（上限 ${maxTasks()}）：${live.map(([, s]) => `「${s.title}」`).join('、')}，等做完或停掉一个再派`;
     return null;
   }
 
