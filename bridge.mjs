@@ -1896,12 +1896,15 @@ async function run() {
     return true;
   }
   let catching = null;
+  // 同一时刻只跑一次。占位用 .finally 放开：里面提前 return 时，放开也排在占上之后
   function catchUp(why) {
-    return (catching ??= (async () => {
+    if (catching) return catching;
+    catching = (async () => {
       try {
         const now = Date.now();
         for (const [id, t] of Object.entries(state.handled)) if (now - t > 24 * 3600e3) delete state.handled[id]; // 飞书自己也会隔一小时以上重推
         const from = Math.max(state.catch_from, now - CATCH_WINDOW);
+        if (now - CATCH_SETTLE <= from) return; // 刚上线不到 20 秒，没有要补的（飞书也不收结束早于开始的查询）
         const missed = [];
         for (const [chat, type] of [[cfg.chat_id, 'group'], [state.dm?.chat_id, 'p2p']]) {
           if (!chat) continue;
@@ -1931,10 +1934,9 @@ async function run() {
         }
       } catch (e) {
         log('catch-up failed', why, e.message);
-      } finally {
-        catching = null;
       }
-    })());
+    })().finally(() => { catching = null; });
+    return catching;
   }
   setInterval(() => catchUp('poll'), 5 * 60e3);
 
