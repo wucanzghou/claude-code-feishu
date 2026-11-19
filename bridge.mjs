@@ -2290,18 +2290,40 @@ async function run() {
   }
 
   // ───── 例行任务 ─────
-  // 配置 routines：[{ name, enabled, at: '08:00', tz, prompt | prompt_file, cwd, fetch, context, max_minutes, model, mode, allowed_tools, disallowed_tools }]，
+  // 配置 routines：[{ name, enabled, at: '08:00', tz, quiet: '23:00-08:00', prompt | prompt_file, cwd, fetch, context, max_minutes, model, mode, allowed_tools, disallowed_tools }]，
   // 或把 at 换成 watch: { repo, remote, branch, ignore_authors, every_minutes, settle_minutes }（远端分支有别人推了新提交就跑）。
   // 到点或触发时不用确认，直接在群里开一个话题、起一个命令行会话去跑（只读，见 ROUTINE_NOTE / ROUTINE_DENY）；
   // 最后一条回复完整发到私聊（有「【私聊】」一行时只发它后面的），没跑成、超时、没输出也发一条。
   // 每个例行任务的进度记在 state.routines[name]：day 哪天跑过（at），head 审到哪个提交（watch）
+  // 夜间免打扰：每项可加 quiet: "23:00-08:00"（按该项的 tz，不填按北京时间；可以跨零点）。时段里 watch 型不 fetch、不开审查，
+  // 新提交攒着（审到哪个提交不动），时段一过下一次检查就从上次审到的地方把攒下的合成一次审；不管哪种，结果和「没跑成」提醒
+  // 赶上时段里的先压在 state（rt.held，重启不丢），时段结束再发私聊
   const routineList = () => (Array.isArray(cfg.routines) ? cfg.routines.filter((r) => r?.name && r.enabled !== false && (r.at || r.watch?.repo)) : []);
   const routineTimers = new Map(); // 会话 id -> 超时停止的定时器
   const routineBusy = (name) => Object.entries(state.sessions).some(([id, s]) => s.routine?.name === name && running.has(id));
   function routineState(id, s) {
     if (running.has(id)) return '进行中';
+    if (s.routine.held) return `${s.routine.result === 'error' ? '没跑成，' : ''}结果压着，免打扰时段过了再发私聊`;
     return { done: '已发私聊', error: '没跑成' }[s.routine.result] ?? '没在跑';
   }
+  // quiet 解析成当天第几分钟 { from, to }；没配是 null，写错了按配置错处理（不跑，私聊说一次）
+  function quietSpan(r) {
+    if (!r?.quiet) return null;
+    const m = String(r.quiet).match(/^\s*(\d{1,2}):(\d{2})\s*[-~～–—到至]\s*(\d{1,2}):(\d{2})\s*$/);
+    const [from, to] = m ? [+m[1] * 60 + +m[2], +m[3] * 60 + +m[4]] : [];
+    if (!m || +m[2] > 59 || +m[4] > 59 || from > 1440 || to > 1440 || from % 1440 === to % 1440)
+      throw Object.assign(new Error(`quiet 写法不对：「${r.quiet}」，应该像 "23:00-08:00"`), { config: true });
+    return { from: from % 1440, to: to % 1440 };
+  }
+  const quietClock = () => Date.now();
+  function quietNow(r) {
+    const q = quietSpan(r);
+    if (!q) return false;
+    const { mins } = zoned(quietClock(), r.tz || 'Asia/Shanghai');
+    return q.from < q.to ? mins >= q.from && mins < q.to : mins >= q.from || mins < q.to; // 跨零点：23:00 起到第二天 08:00 前
+  }
+  // 发结果时按名字找配置（停用的也算）；配置找不到、写错了都当不在免打扰里，免得结果压着发不出去
+  const quietFor = (name) => { try { return quietNow((Array.isArray(cfg.routines) ? cfg.routines : []).find((r) => r?.name === name)); } catch { return false; } };
   const expand = (p) => String(p).replace(/^~(?=$|\/)/, os.homedir());
   // 某时区里的日期和当天第几分钟（早报按北京时间 8 点，不跟着电脑时区走）
   function zoned(t, tz) {
@@ -2388,7 +2410,7 @@ async function run() {
   // 私聊发结果：最后一条回复（所有工具调用之后的文字）；有「【私聊】」一行时只发它后面的（前面的详细意见留在话题里）
   async function routineResult(id, records, until) {
     const s = session(id), rt = s.routine;
-    if (rt.sent || rt.sending || !dmChat()) return;
+    if (rt.sent || rt.sending || rt.held || !dmChat()) return;
     // Stop 钩子来了就是这一轮结束了，不再看 ended（摘要记录可能还没写进文件）
     const res = schedResult(records.filter((r) => !until || !r.timestamp || Date.parse(r.timestamp) <= until));
     const files = [];
@@ -2400,21 +2422,41 @@ async function run() {
     // 第一行已经像标题（带名字，或以表情、粗体开头）就不另加
     const first = text.split('\n')[0];
     const head = first.includes(rt.name) || /^\s*(\p{Extended_Pictographic}|\*\*)/u.test(first) ? '' : `⏰ **${rt.name}**\n`;
-    const parts = chunks(head + text);
-    await deliverRoutine(rt, async () => {
-      for (const p of parts.slice(0, -1)) await post(p, null, dmChat());
-      await postCard([{ tag: 'markdown', content: parts.at(-1) }, buttonRow([button('在桌面打开', { a: 'desk', sid: id })])], null, dmChat());
-    }, { result: 'done', line: text.split('\n').find((l) => l.trim())?.replace(/[*#>]/g, '').trim() });
-    for (const f of files) await sendFile(resolvePath(f, s.cwd), null, dmChat()).catch((e) => post(`📎 \`${f}\` 没发出去：${e.message}`, null, dmChat()));
-    log('routine result sent', rt.name, id.slice(0, 8));
+    await routineSend(id, { parts: chunks(head + text), files, cwd: s.cwd }, { result: 'done', line: text.split('\n').find((l) => l.trim())?.replace(/[*#>]/g, '').trim() });
   }
   async function routineFailed(id, why) {
     const s = session(id), rt = s.routine;
-    if (rt.sent || rt.sending) return;
+    if (rt.sent || rt.sending || rt.held) return;
     log('routine failed', rt.name, id.slice(0, 8), why.slice(0, 80));
     if (!dmChat()) return Object.assign(rt, { sent: true, result: 'error', line: `没跑成：${why}` }), save();
-    await deliverRoutine(rt, () => postCard([{ tag: 'markdown', content: `⚠️ **${rt.name}** 没跑成：${why}\n过程在群里的话题「${s.title}」` }, buttonRow([button('在桌面打开', { a: 'desk', sid: id })])], null, dmChat()),
-      { result: 'error', line: `没跑成：${why}` }).catch((e) => log('routine notify failed', e.message));
+    await routineSend(id, { parts: [`⚠️ **${rt.name}** 没跑成：${why}\n过程在群里的话题「${s.title}」`] }, { result: 'error', line: `没跑成：${why}` })
+      .catch((e) => log('routine notify failed', e.message));
+  }
+  // 结果发私聊（前几段文字、最后一段带「在桌面打开」的卡片，再发文件）。免打扰时段里先不发：要发的整个记在 rt.held
+  // （存进 state，重启不丢；result / line 先记上，秘书 list_tasks 能看到），时段一过 flushHeld 原样补发
+  async function routineSend(id, msg, done) {
+    const rt = session(id).routine;
+    if (quietFor(rt.name)) {
+      Object.assign(rt, { held: { msg, done, at: Date.now() } }, done);
+      save();
+      return log('routine held (quiet)', rt.name, id.slice(0, 8));
+    }
+    await deliverRoutine(rt, async () => {
+      for (const p of msg.parts.slice(0, -1)) await post(p, null, dmChat());
+      await postCard([{ tag: 'markdown', content: msg.parts.at(-1) }, buttonRow([button('在桌面打开', { a: 'desk', sid: id })])], null, dmChat());
+    }, done);
+    if (rt.held) delete rt.held, save();
+    for (const f of msg.files ?? []) await sendFile(resolvePath(f, msg.cwd), null, dmChat()).catch((e) => post(`📎 \`${f}\` 没发出去：${e.message}`, null, dmChat()));
+    log('routine result sent', rt.name, id.slice(0, 8));
+  }
+  // 免打扰时段过了（或配置里去掉了 quiet、改了名）：把压着的结果补发。正在发（重试中）的不重复发，发成功才去掉 held
+  function flushHeld() {
+    for (const [id, s] of Object.entries(state.sessions)) {
+      const rt = s.routine;
+      if (!rt?.held || rt.sending || quietFor(rt.name)) continue;
+      log('routine held release', rt.name, id.slice(0, 8));
+      routineSend(id, rt.held.msg, rt.held.done).catch((e) => log('routine held send failed', rt.name, e.message));
+    }
   }
   // 往私聊发结果：发成功了才记 sent；失败（多半断网）隔 30 秒重试，共 4 次。发的过程中（sending）别处不再发
   async function deliverRoutine(rt, send, done) {
@@ -2443,15 +2485,16 @@ async function run() {
       await drain().catch(() => {});
       const s = session(id);
       // 钩子没报上来（没收到 Stop）时自己读对话文件
-      if (rt.sent || rt.sending) return; // 结果已发、或正在发（重试中）
+      if (rt.sent || rt.sending || rt.held) return; // 结果已发、正在发（重试中）、或压着等免打扰过去
       if (!why && s.transcript) await routineResult(id, readTail(s.transcript)).catch((e) => log('routine result failed', e.message));
-      if (!rt.sent && !rt.sending) routineFailed(id, why ?? '跑完了，但最后没有文字结果');
+      if (!rt.sent && !rt.sending && !rt.held) routineFailed(id, why ?? '跑完了，但最后没有文字结果');
     }, why ? 0 : 5000);
   }
   // 转发程序重启（部署、崩溃）会杀掉正在跑的例行任务：到点跑的今天重跑一次，审查的把没审完的范围放回去重审
   function recoverRoutines() {
     for (const [id, s] of Object.entries(state.sessions)) {
       const rt = s.routine;
+      if (rt?.held) { delete rt.sending; continue; } // 跑完了、结果压着等免打扰过去：不算被打断，flushHeld 会发
       if (!rt || rt.sent || Date.now() - rt.started > 12 * 3600e3) continue;
       delete rt.sending;
       const st = state.routines?.[rt.name];
@@ -2468,7 +2511,8 @@ async function run() {
   const SETTLE_MAX = 30 * 60e3;
   async function watchTick(r, st) {
     const w = r.watch, now = Date.now();
-    if (now < (st.next ?? 0)) return;
+    // 免打扰：不 fetch、不开审查，head / pending 都不动；时段一过 next 早就到了，下一次检查就把攒下的合成一次审
+    if (quietNow(r) || now < (st.next ?? 0)) return;
     st.next = now + (Number(w.every_minutes) || 20) * 60e3;
     const repo = expand(w.repo), ref = `${w.remote ?? 'origin'}/${w.branch ?? 'develop'}`;
     let head;
@@ -2511,10 +2555,12 @@ async function run() {
     if (routineTicking || !dmChat()) return; // 还没人私聊过机器人：结果没地方发
     routineTicking = true;
     try {
+      flushHeld();
       for (const r of routineList()) {
         const st = ((state.routines ??= {})[r.name] ??= {});
         if (routineBusy(r.name)) continue;
         try {
+          quietSpan(r); // quiet 写错了按配置错：不跑，私聊说一次
           if (r.watch?.repo) { await watchTick(r, st); continue; }
           const [h, m] = String(r.at).split(':').map(Number), due = h * 60 + (m || 0);
           const { day, mins } = zoned(Date.now(), r.tz);

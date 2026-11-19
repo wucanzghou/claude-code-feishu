@@ -150,6 +150,7 @@ Claude 在回复里单独写一行 `[发送文件] /绝对路径`（转发程序
 - **到点跑的**（`at`）：按 `tz` 时区（不填按电脑时区）每天到点跑一次；电脑睡着、转发程序没开错过了点，`catchup_hours`（默认 6）小时内补跑，再晚当天就不跑了。第一次启用时当天已经过了点的，从第二天开始。
 - **有新提交才跑的**（`watch`）：每 `every_minutes`（默认 20）分钟 fetch 一次，`origin/develop` 这类分支上出现作者不在 `ignore_authors` 里的新提交（不含合并提交），先等 `settle_minutes`（默认 5）分钟看还有没有接着推的（连着推的合成一次，最多等 30 分钟），再开一个会话，提示词后面附上提交清单和范围。审到哪个提交记在 `state.json` 的 `routines` 里，第一次启用时把当时的分支头当起点，不审历史。上一次还在跑时等它跑完。fetch 连续失败 3 次私聊说一声。
 - 转发程序重启时杀掉了正在跑的例行任务：到点跑的当天重跑一次，审查的把没审完的范围放回去重审。
+- **夜间免打扰**（`quiet`，如 `"quiet": "23:00-08:00"`）：按该项的 `tz` 算（不填按北京时间），可以跨零点。时段里 `watch` 型不 fetch、不开审查，新提交照常攒着（审到哪个提交不动），时段一过下一次检查就从上次审到的地方把攒下的提交合成一次审。时段前开始、跑到时段里才结束的，结果先压着（记在 `state.json`，重启不丢），时段结束再发私聊；「没跑成」「超时」这类提醒一样。`at` 型的点落在时段里照常跑，结果同样压到时段结束。
 - 例行任务的会话不自动导入桌面版（没人看着时窗口不该自己切走），也不算秘书派的任务；秘书的 `list_tasks` 里单列最近 24 小时的例行任务，`task_detail` 能看全文。
 - `context` 让转发程序在提示词后面附上它已知的情况：`scheduled` = 桌面版定时任务（见上一节）最近 36 小时每个任务最近一次的结论；`tasks` = 过去 24 小时秘书派出去的任务按状态分组。
 
@@ -157,12 +158,12 @@ Claude 在回复里单独写一行 `[发送文件] /绝对路径`（转发程序
 "routines": [
   { "name": "早报", "at": "08:00", "tz": "Asia/Shanghai", "cwd": "/path/to/repo", "fetch": "/path/to/repo",
     "prompt_file": "~/.claude/feishu-bridge/routines/早报.md", "context": ["scheduled", "tasks"] },
-  { "name": "develop 审查", "watch": { "repo": "/path/to/repo", "branch": "develop", "ignore_authors": ["me"] },
+  { "name": "develop 审查", "watch": { "repo": "/path/to/repo", "branch": "develop", "ignore_authors": ["me"] }, "quiet": "23:00-08:00",
     "prompt_file": "~/.claude/feishu-bridge/routines/develop审查.md" }
 ]
 ```
 
-提示词里的 `{{date}}` 换成当天日期和星期（如「11-20 周五」；示例里写死的日期模型会照抄）。每项可选：`enabled`（`false` 停用）、`prompt`（直接写提示词，代替 `prompt_file`）、`max_minutes`（默认 30）、`model`、`mode`（权限模式，不填用默认）、`allowed_tools` / `disallowed_tools`（加到命令行的放行、禁用清单里）。改了配置要重启转发程序。
+提示词里的 `{{date}}` 换成当天日期和星期（如「11-20 周五」；示例里写死的日期模型会照抄）。每项可选：`enabled`（`false` 停用）、`quiet`（夜间免打扰时段，见上）、`prompt`（直接写提示词，代替 `prompt_file`）、`max_minutes`（默认 30）、`model`、`mode`（权限模式，不填用默认）、`allowed_tools` / `disallowed_tools`（加到命令行的放行、禁用清单里）。改了配置要重启转发程序。
 
 ## 安全边界
 
