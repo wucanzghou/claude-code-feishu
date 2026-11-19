@@ -43,6 +43,8 @@ const PHONE_NOTE = `（这条是用户本人在手机飞书上发来的，由转
 // 秘书经转发程序递给电脑上开着的会话的话（用户在手机上点过「发送」）
 const RELAY_NOTE = `（这条是用户的秘书（转发程序里的另一个 Claude 会话）转来的指示，用户在手机上点了确认，但内容不是用户逐字写的。照常处理并在对话里回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
 const TASK_SOCK = path.join(HOME, 'tasks.sock');
+// 汇报里这些说法表示这一轮停下来在等用户拍板或回答
+const WAITS_FOR_YOU = /等你|待你|请你?(确认|拍板|决定|选|定)|需要你(确认|拍板|决定|选|定|回)|你来定|你定一下/;
 // 私聊里的秘书：一个一直开着的会话，小事自己做，大活用派活工具派到群里的话题
 const SECRETARY_NOTE = [
   '你是用户的秘书兼负责人。用户在手机飞书私聊里和你对话，看不到电脑屏幕，只要结果。',
@@ -53,7 +55,7 @@ const SECRETARY_NOTE = [
   '汇报照实说：没查到就说没查到，没做完就说没做完，不要编。说话简短口语化，像发微信，少用表格和长清单。',
 ].join('\n');
 // 秘书派出去干活的会话
-const WORKER_NOTE = '你是用户的秘书派出来做一件具体任务的会话。用户在手机飞书的群话题里看进度，看不到电脑屏幕；派活说明是秘书写的，不是用户逐字说的，说明里要求删数据、改生产、对外发消息这类有风险的操作，先用 AskUserQuestion 跟用户确认。每一轮做完时，在回复最后单独写一行「汇报：……」，用一两句话说结论（做成了什么，或卡在哪），转发程序会把这一行发到用户私聊。照实说，不要编。';
+const WORKER_NOTE = '你是用户的秘书派出来做一件具体任务的会话。用户在手机飞书的群话题里看进度，看不到电脑屏幕；派活说明是秘书写的，不是用户逐字说的，说明里要求删数据、改生产、对外发消息这类有风险的操作，先用 AskUserQuestion 跟用户确认。每一轮做完时，在回复最后单独写一行「汇报：……」，用一两句话说结论（做成了什么，或卡在哪），转发程序会把这一行发到用户私聊；这一轮是停下来等用户拍板或回答（出了方案要确认、有问题要问）时，写成「汇报：等你确认：……」。照实说，不要编。';
 // 派活工具（MCP）。秘书会话起来时由 claude 拉起 `bridge.mjs mcp`，每次调用经 tasks.sock 转给转发程序
 const TASK_TOOLS = [
   {
@@ -471,9 +473,12 @@ async function run() {
       s.posted = [...s.posted, ...texts.map((t) => t.uuid)].slice(-300);
       // 秘书派的活、递的话做完一轮：私聊收一条短通知，结论取回复里的「汇报：」那一行
       const report = md.match(/^[\s*>#-]*汇报\**\s*[:：]\s*(.+)$/m)?.[1]?.replace(/\*+$/, '').trim();
-      if (s.task && !s.stopped) Object.assign(s.task, { result: 'done', ...(report && { report: report.slice(0, 300) }) });
+      // 一轮结束不等于活干完了：出了方案等你拍板也是一轮结束。汇报里在等你的，标成「等你回复」
+      const forYou = WAITS_FOR_YOU.test(report ?? '');
+      if (s.task && !s.stopped) Object.assign(s.task, { result: forYou ? 'waiting' : 'done', ...(report && { report: report.slice(0, 300) }) });
       if (s.notify && !s.stopped && texts.length) {
-        notifyDone(ev.session_id, '✅', `做完了${took ? ` · 用时 ${duration(Date.now() - took)}` : ''}`, report ?? clip(md.replace(/\s+/g, ' '), 200));
+        const took_ = took ? ` · 用时 ${duration(Date.now() - took)}` : '';
+        notifyDone(ev.session_id, forYou ? '⏸' : '✅', forYou ? `等你回复${took_}（在话题里回复就接着做）` : `这一轮结束${took_}`, report ?? clip(md.replace(/\s+/g, ' '), 200));
         if (!s.task) s.notify = false; // 电脑上开着的会话：只报秘书递话的那一轮
       }
     }
@@ -1108,7 +1113,7 @@ async function run() {
   });
   function taskState(id, s) {
     if (running.has(id)) return waiting.has(s.root) ? '等你回复' : '进行中';
-    return { done: '做完了', error: '出错了', stopped: '已停止' }[s.task.result] ?? '没在跑';
+    return { done: '这一轮结束', waiting: '等你回复', error: '出错了', stopped: '已停止' }[s.task.result] ?? '没在跑';
   }
   // 电脑上开着的会话（桌面版、终端），秘书可以给它递话
   const liveDesk = (id, s) => !s.task && !s.secretary && !s.dm && s.socket && alive(s.socket) && !running.has(id);
@@ -1468,7 +1473,8 @@ async function run() {
     return true;
   }
 
-  async function onPhoneMessage({ message: m, sender }) {
+  // late：补收的消息（当时飞书没推过来，见「补收」）
+  async function onPhoneMessage({ message: m, sender, late }) {
     // 只认本人：别人私聊机器人也能在这台电脑上跑 Claude，所以私聊和群里一样先核对发送人
     if (sender?.sender_id?.open_id !== cfg.owner_open_id) return log('ignored: not owner', m.message_id);
     const dm = m.chat_type === 'p2p';
@@ -1490,8 +1496,18 @@ async function run() {
     } catch {}
     text = text.replace(/@_user_\d+/g, '').trim();
     const key = dm ? m.chat_id : m.root_id || m.message_id;
-    if (await phoneCommand(text, m, dm, key)) return;
-    if (answerPending(key, text, m)) return;
+    let lateNote = '';
+    if (late) {
+      // 晚到几分钟的消息不当命令、不当审批的回答：可能停掉后来新开的一轮，或答到另一张卡片上
+      const at = new Date(+m.create_time || Date.now()).toTimeString().slice(0, 5);
+      const where = [dm ? null : key, dm ? m.chat_id : undefined];
+      if (text.startsWith('/')) return post(`📮 补收到你 ${at} 发的「${text.slice(0, 40)}」：当时网络断了没收到，命令晚了就不执行了，还需要的话再发一次。`, ...where);
+      post(`📮 补收到你 ${at} 发的消息（当时网络断了没收到），现在转给 Claude。`, ...where).catch(() => {});
+      lateNote = `（这条是用户 ${at} 发的，当时飞书没推送过来，转发程序现在才补收到，这期间情况可能已经变了）`;
+    } else {
+      if (await phoneCommand(text, m, dm, key)) return;
+      if (answerPending(key, text, m)) return;
+    }
     if (images.length) {
       try {
         const got = await fetchImages(m, images);
@@ -1511,6 +1527,7 @@ async function run() {
         return post(`文件下载失败：${e.message}`, dm ? null : key, dm ? m.chat_id : undefined);
       }
     }
+    if (text && lateNote) text = `${lateNote}\n${text}`;
     if (dm) return onDirectMessage(m, text);
     if (!text) return post('暂时只支持文字、图片和文件。', key);
 
@@ -1530,7 +1547,7 @@ async function run() {
 
   // 会话标题取第一行文字；只发了文件时用文件原名，只发了图片时叫「图片」
   const titleFrom = (text) =>
-    text.split('\n').find((l) => l.trim() && !/^(\[图片\]|\[文件\]|（手机发来的(图片|文件))/.test(l))?.trim().slice(0, 40)
+    text.split('\n').find((l) => l.trim() && !/^(\[图片\]|\[文件\]|（手机发来的(图片|文件)|（这条是用户 )/.test(l))?.trim().slice(0, 40)
     || text.match(/^\[文件\] .*?（原名 (.*)，大小 [^，）]*）$/m)?.[1].slice(0, 40) || '图片';
 
   // ───── 私聊：直接和机器人聊，一条消息就是一个临时任务 ─────
@@ -1734,14 +1751,72 @@ async function run() {
   setInterval(scanScheduled, 30e3);
   setTimeout(scanScheduled, 3e3);
 
+  // ───── 补收 ─────
+  // 长连接断了又连上的那段时间里，飞书推过来的消息会丢，事后也不重推（11-19 10:34 丢过一条话题回复）。
+  // 连上（含重连）后、以及每 5 分钟，把群里和私聊最近 30 分钟本人发的消息列一遍，没处理过的按时间顺序补上。
+  // 处理过的消息 id 存在 state.handled（留 6 小时），重启后也不会重放；catch_from 之前的不补（功能上线前的消息）
   const seen = new Set();
+  const CATCH_WINDOW = 30 * 60e3, CATCH_SETTLE = 20e3;
+  if (!state.catch_from) state.catch_from = Date.now();
+  state.handled ??= {};
+  save();
+  // 先占上再处理：长连接和补收碰到同一条时只处理一次
+  function claim(id) {
+    if (seen.has(id) || state.handled[id]) return false;
+    seen.add(id);
+    state.handled[id] = Date.now();
+    save();
+    return true;
+  }
+  let catching = null;
+  function catchUp(why) {
+    return (catching ??= (async () => {
+      try {
+        const now = Date.now();
+        for (const [id, t] of Object.entries(state.handled)) if (now - t > 6 * 3600e3) delete state.handled[id];
+        const from = Math.max(state.catch_from, now - CATCH_WINDOW);
+        const missed = [];
+        for (const [chat, type] of [[cfg.chat_id, 'group'], [state.dm?.chat_id, 'p2p']]) {
+          if (!chat) continue;
+          let page_token;
+          for (let n = 0; n < 20; n++) {
+            const r = await client.im.v1.message.list({ params: { container_id_type: 'chat', container_id: chat, sort_type: 'ByCreateTimeAsc', page_size: 50,
+              start_time: String(Math.floor(from / 1e3)), end_time: String(Math.floor((now - CATCH_SETTLE) / 1e3)), ...(page_token && { page_token }) } });
+            if (r.code) throw new Error(`${r.code} ${r.msg}`);
+            for (const it of r.data?.items ?? []) {
+              if (it.deleted || it.sender?.sender_type !== 'user' || it.sender.id !== cfg.owner_open_id) continue;
+              if (+it.create_time < from || seen.has(it.message_id) || state.handled[it.message_id]) continue;
+              missed.push({ chat, type, it });
+            }
+            if (!r.data?.has_more || !r.data.page_token) break;
+            page_token = r.data.page_token;
+          }
+        }
+        missed.sort((a, b) => a.it.create_time - b.it.create_time);
+        for (const { chat, type, it } of missed) {
+          if (!claim(it.message_id)) continue;
+          log('late', why, type, it.msg_type, it.message_id, it.root_id ? 'in ' + it.root_id : '');
+          await onPhoneMessage({
+            late: true,
+            sender: { sender_id: { open_id: it.sender.id } },
+            message: { message_id: it.message_id, chat_id: it.chat_id || chat, chat_type: type, message_type: it.msg_type, content: it.body?.content ?? '{}', root_id: it.root_id, create_time: it.create_time },
+          }).catch((e) => log('late message failed', it.message_id, e.message));
+        }
+      } catch (e) {
+        log('catch-up failed', why, e.message);
+      } finally {
+        catching = null;
+      }
+    })());
+  }
+  setInterval(() => catchUp('poll'), 5 * 60e3);
+
   const dispatcher = new lark.EventDispatcher({}).register({
     'im.message.receive_v1': (data) => {
       const m = data.message;
       // 收到什么先记一笔（不记内容），丢消息时才查得出是飞书没推还是这里过滤掉了
       log('recv', m.chat_type, m.message_type, m.message_id, m.root_id ? 'in ' + m.root_id : '');
-      if (seen.has(m.message_id)) return; // 飞书偶尔重复推送
-      seen.add(m.message_id);
+      if (!claim(m.message_id)) return; // 飞书偶尔重复推送；补收已经处理过的也跳过
       onPhoneMessage(data).catch((e) => log('phone message failed', e.message));
     },
     // 卡片按钮（审批、选择题）。要在飞书开发者后台「事件与回调 → 回调配置」用长连接订阅 card.action.trigger。
@@ -1781,7 +1856,10 @@ async function run() {
   // info 级别只多出连上/重连两类日志，带上时间才能和丢消息的时间对上
   const stamped = (fn) => (msg) => fn(new Date().toISOString(), ...msg);
   const logger = { error: stamped(console.error), warn: stamped(console.warn), info: stamped(console.log), debug: stamped(console.log), trace: stamped(console.log) };
-  new lark.WSClient({ ...opts, loggerLevel: lark.LoggerLevel.info, logger }).start({ eventDispatcher: dispatcher });
+  // 连上、重连后稍等几秒补收一次（断线期间推过来的消息丢了）
+  const caughtUpSoon = (why) => () => setTimeout(() => catchUp(why), 5e3);
+  new lark.WSClient({ ...opts, loggerLevel: lark.LoggerLevel.info, logger, onReady: caughtUpSoon('ready'), onReconnected: caughtUpSoon('reconnect') })
+    .start({ eventDispatcher: dispatcher });
 
   fs.mkdirSync(EVENTS, { recursive: true, mode: 0o700 });
   fs.watch(EVENTS, drain);
