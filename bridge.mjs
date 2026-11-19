@@ -1415,8 +1415,11 @@ async function run() {
   setInterval(() => refreshBoard().catch((e) => log('board refresh failed', e.message)), 30e3);
 
   // 秘书一直用同一个会话，每条消息都要把整段历史重读一遍，越聊越贵。隔了天（早上 4 点算新一天），
-  // 或上下文超过 secretary_max_context（默认 8 万 token，0 = 不按大小换）就换一个新秘书，
+  // 或上下文超过 secretary_max_context（默认 8 万 token，0 = 不按大小换）且用户歇了 30 分钟以上再发消息，就换一个新秘书；
+  // 正聊着不换（秘书一开场就有四五万，每条消息跑一串工具又涨两三万，按 8 万硬换就是两三句一换），
+  // 除非超过 15 万（再大就快到 claude 自己压缩上下文的线了）。
   // 交接不靠模型总结：转发程序把任务清单和最近几句对话塞进新秘书的第一条消息
+  const SECRETARY_PAUSE = 30 * 60e3, SECRETARY_HARD = 150000;
   const HANDOFF_END = '——以上是交接，下面是用户刚发来的消息——';
   function contextTokens(file) {
     const recs = readTail(file, 1 << 20);
@@ -1430,8 +1433,12 @@ async function run() {
     const day = (t) => new Date(t - 4 * 3600e3).toDateString();
     if (last && day(last) !== day(Date.now())) return '隔了一天';
     const max = Number(cfg.secretary_max_context ?? 80000);
-    const ctx = max > 0 ? contextTokens(s.transcript) : 0;
-    return ctx > max ? `上下文约 ${(ctx / 1e4).toFixed(1)} 万 token` : null;
+    if (!(max > 0)) return null;
+    const ctx = contextTokens(s.transcript), size = `上下文约 ${(ctx / 1e4).toFixed(1)} 万 token`;
+    if (ctx > Math.max(max, SECRETARY_HARD)) return size;
+    const idle = last ? Date.now() - last : Infinity;
+    if (ctx > max && idle >= SECRETARY_PAUSE) return last ? `歇了 ${idle < 2 * 3600e3 ? `${Math.round(idle / 60e3)} 分钟` : `${(idle / 3600e3).toFixed(1)} 小时`}、${size}` : size;
+    return null;
   }
   function handoffNote(oldId, why) {
     const rounds = [];
