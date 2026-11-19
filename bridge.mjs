@@ -1154,8 +1154,9 @@ async function run() {
 
   // ───── 大屏 ─────
   // 私聊发 /大屏（或 /board）：一张汇总卡片，等你的放最上面，然后是正在跑的、最近结束的。
-  // 每 30 秒刷新一次（内容变了才改），两小时后停；再发一次 /大屏 换成新的一张，旧的那张不再刷新
-  const BOARD_LIFE = 2 * 3600e3, BOARD_RECENT = 12 * 3600e3;
+  // 卡片置顶（Pin）在私聊里，一直每 30 秒刷新（内容变了才改）；飞书只让改 14 天内的消息，12 天后自动换一张新的再置顶。
+  // 再发一次 /大屏 换成新的一张，旧的取消置顶、不再刷新
+  const BOARD_LIFE = 12 * 86400e3, BOARD_RECENT = 12 * 3600e3;
   const span = (ms) => (ms < 60e3 ? '不到 1 分钟' : ms < 3600e3 ? `${Math.floor(ms / 60e3)} 分钟`
     : `${Math.floor(ms / 3600e3)} 小时${Math.floor((ms % 3600e3) / 60e3) ? ` ${Math.floor((ms % 3600e3) / 60e3)} 分` : ''}`);
   // 正在做的那一步：有计划显示计划进度，没有就显示最近一次工具调用
@@ -1207,28 +1208,39 @@ async function run() {
     const head = `**📊 任务大屏** · 等你 ${rows.ask.length + rows.wait.length} · 进行中 ${rows.run.length}`;
     return [head, ...(parts.length ? parts : ['最近 12 小时没有任务。'])].join('\n\n');
   }
-  const boardCard = (md, until) => [
-    { tag: 'markdown', content: `${md}\n\n<font color='grey'>${when(Date.now())} 更新${until > Date.now() ? ' · 每 30 秒自动刷新' : ' · 已停止自动刷新，点刷新或再发 /大屏'}</font>` },
+  const boardCard = (md, live) => [
+    { tag: 'markdown', content: `${md}\n\n<font color='grey'>${when(Date.now())} 更新${live ? ' · 每 30 秒自动刷新' : ' · 这张已不再自动刷新，再发 /大屏'}</font>` },
     buttonRow([button('刷新', { a: 'board' })]),
   ];
+  const apiError = (e) => (e?.response?.data?.msg ? `${e.response.data.code ?? ''} ${e.response.data.msg}`.trim() : e?.message ?? String(e));
   let boardShown = '';
-  async function refreshBoard(force) {
+  async function refreshBoard() {
     const b = state.board;
-    if (!b?.msg || (!force && Date.now() > b.until)) return;
+    if (!b?.msg) return;
+    if (Date.now() > b.until) return b.chat ? postBoard(b.chat, true) : undefined; // 快到飞书改消息的期限了，换一张新的
     const md = boardMd();
-    if (!force && md === boardShown) return;
+    if (md === boardShown) return;
     boardShown = md;
-    await patchCard(b.msg, boardCard(md, b.until));
+    await patchCard(b.msg, boardCard(md, true));
   }
-  async function postBoard(chat) {
+  async function postBoard(chat, renew) {
     const md = boardMd();
-    boardShown = md;
-    const until = Date.now() + BOARD_LIFE;
     const old = state.board;
-    state.board = { msg: await postCard(boardCard(md, until), null, chat), until };
+    const msg = await postCard(boardCard(md, true), null, chat);
+    boardShown = md;
+    state.board = { msg, chat, until: Date.now() + BOARD_LIFE };
     save();
-    // 旧的那张标上不再刷新
-    if (old?.msg && old.until > Date.now()) patchCard(old.msg, [{ tag: 'markdown', content: '（这张大屏已不再刷新，看最新的那张）' }]).catch(() => {});
+    // 置顶新的，旧的取消置顶、标上不再刷新
+    const pinned = await client.im.v1.pin.create({ data: { message_id: msg } })
+      .then((r) => (r.code ? `${r.code} ${r.msg}` : null), apiError);
+    if (pinned) {
+      log('board pin failed', pinned);
+      if (!renew) post(`📌 大屏没能置顶：${pinned}\n大屏照样每 30 秒刷新。要置顶的话，到飞书开发者后台给应用开通 Pin 消息的权限并发布新版本，再发一次 /大屏。`, null, chat).catch(() => {});
+    }
+    if (old?.msg && old.msg !== msg) {
+      client.im.v1.pin.delete({ path: { message_id: old.msg } }).catch(() => {});
+      patchCard(old.msg, boardCard(boardMd(), false)).catch(() => {});
+    }
   }
   setInterval(() => refreshBoard().catch((e) => log('board refresh failed', e.message)), 30e3);
 
@@ -1642,7 +1654,7 @@ async function run() {
       ? '这里是你的秘书：一个一直开着的 Claude 会话。小事它自己做，大活它派到群里单独的话题里做（要你点「派」才开始），做完、出错、等你确认时这里会收到通知。'
       : '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
     ...(secretaryOn() ? ['`/tasks` 看派出去的任务和电脑上开着的会话'] : []),
-    '`/大屏` 一张自动刷新的任务汇总：等你的、正在跑的、最近结束的',
+    '`/大屏` 一张置顶、自动刷新的任务汇总：等你的、正在跑的、最近结束的',
     `\`/new [内容]\` ${secretaryOn() ? '换一个新的秘书会话（派出去的任务不受影响）' : '结束当前任务，开新任务'}`,
     `\`/cd <别名或绝对路径> [内容]\` 在指定目录开新${secretaryOn() ? '的秘书会话' : '任务'}`,
     '`/stop` 停止正在跑的那一轮（也可以点「工作中」卡片上的停止）',
@@ -1922,12 +1934,11 @@ async function run() {
         return { toast: { type: 'success', content: '正在停止' }, ...(st && { card: { type: 'raw', data: JSON.parse(cardOf(statusCard(v.sid, st))) } }) };
       }
       if (/^(no)?(dispatch|send)$/.test(v.a)) return answerAsk(v); // 秘书派活、递话的确认
-      if (v.a === 'board') { // 大屏上的「刷新」：直接换成最新内容，顺便再续两小时自动刷新
-        const msg = data.context?.open_message_id;
-        if (state.board?.msg === msg) state.board.until = Date.now() + BOARD_LIFE, save();
+      if (v.a === 'board') { // 大屏上的「刷新」：直接换成最新内容
+        const current = state.board?.msg === data.context?.open_message_id;
         const md = boardMd();
-        if (state.board?.msg === msg) boardShown = md;
-        return { toast: { type: 'success', content: '已刷新' }, card: { type: 'raw', data: JSON.parse(cardOf(boardCard(md, state.board?.msg === msg ? state.board.until : 0))) } };
+        if (current) boardShown = md;
+        return { toast: { type: 'success', content: '已刷新' }, card: { type: 'raw', data: JSON.parse(cardOf(boardCard(md, current))) } };
       }
       if (v.a === 'open') { // 定时任务提醒上的「在桌面打开」：会话本来就是桌面版的，直接跳过去，不像 desk 那样导入改标题
         if (!/^[0-9a-f-]{36}$/.test(v.sid ?? '')) return { toast: { type: 'info', content: '找不到这个会话' } };
