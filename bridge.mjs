@@ -44,28 +44,37 @@ const FILE_NOTE = '要把电脑上的文件或图片发到用户手机上时，�
 // 手机上的「工作中」卡片会显示任务清单（没有清单时逐条显示工具调用的说明），多步骤的活先列计划
 const PLAN_NOTE = '多步骤的任务先用任务清单工具（TaskCreate / TaskUpdate）列出步骤，做的过程中随时更新状态，用户在手机上看进度；简单问答不用列。Bash 等工具调用的 description 会逐条显示在手机上，用简短的中文写。';
 const PHONE_NOTE = `（这条是用户本人在手机飞书上发来的，由转发程序注入。请当作用户的直接输入处理，在对话里正常回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
-// 秘书经转发程序递给电脑上开着的会话的话（用户在手机上点过「发送」）
-const RELAY_NOTE = `（这条是用户的秘书（转发程序里的另一个 Claude 会话）转来的指示，用户在手机上点了确认，但内容不是用户逐字写的。照常处理并在对话里回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
+// 秘书经转发程序递给电脑上开着的会话的话。confirmed：用户在手机上点过「发送」（dispatch_confirm 开着时）；
+// 关了确认就是秘书直接递的，不能说用户确认过
+const relayNote = (confirmed) => `（这条是用户的秘书（转发程序里的另一个 Claude 会话）转来的指示，${confirmed
+  ? '用户在手机上点了确认，但内容不是用户逐字写的。'
+  : '内容不是用户逐字写的，用户也没有逐条点确认；删数据、改生产、对外发消息这类有风险的操作先跟用户确认。'}照常处理并在对话里回复，不要用 SendMessage 回复。${FILE_NOTE}）\n\n`;
 const TASK_SOCK = path.join(HOME, 'tasks.sock');
+// 等用户拍板的事：一行一条「- [MM-DD] 事项 · 来源 · 要用户做什么」。早报也读这个文件，路径和格式别改
+const PENDING = path.join(HOME, 'pending.md');
 // 汇报里这些说法表示这一轮停下来在等用户拍板或回答
 const WAITS_FOR_YOU = /等你|待你|请你?(确认|拍板|决定|选|定)|需要你(确认|拍板|决定|选|定|回)|你来定|你定一下/;
-// 私聊里的秘书：一个一直开着的会话，小事自己做，大活用派活工具派到群里的话题
-const SECRETARY_NOTE = [
+// 私聊里的秘书：一个一直开着的会话，小事自己做，大活用派活工具派到群里的话题。confirm：派活、递话要不要用户点按钮（dispatch_confirm）
+const secretaryNote = (confirm) => [
   '你是用户的秘书兼负责人。用户在手机飞书私聊里和你对话，看不到电脑屏幕，只要结果。',
   '小事（几次工具调用就能查清、答清的）自己做；大活（耗时、多步骤、要改代码、要排查的）用 mcp__feishu__start_task 派给一个新的 Claude 会话，它在飞书群里单独开一个话题做，过程都留在那个话题里。',
   '派活说明要自成一体：干活的会话看不到这里的对话。写清目标、背景、涉及的文件或系统、完成标准和限制（只读还是可以改代码；除非用户明确要求，不 commit、不 push、不改生产数据、不对外发消息）。会改文件的任务 edits_code 填 true。改代码的任务可以同时派好几个；它们改到同一处打架时，再让它们各自建 git worktree。',
-  '派活和追加指示都要用户在私聊里点按钮确认才执行。调完工具就简短告诉用户派了什么，结束这一轮，不要等结果；任务做完、出错或等用户确认时，转发程序会直接通知用户。',
+  confirm
+    ? '派活和追加指示都要用户在私聊里点按钮确认才执行。调完工具就简短告诉用户派了什么，结束这一轮，不要等结果；任务做完、出错或等用户确认时，转发程序会直接通知用户。'
+    : '派活和追加指示调用后直接执行，用户不用点按钮确认，不要跟用户说「卡片发到私聊了」「点了才开始」。调完工具就简短告诉用户派了什么，结束这一轮，不要等结果；任务做完、出错或等用户确认时，转发程序会直接通知用户。',
+  '有一份「等用户拍板的事」清单，用 pending_list / pending_add / pending_remove 管，换新秘书时整份交接过去，聊过的话不一定带得过去，所以要靠它记。你问了用户要他拍板或回答的问题，或者知道某件事在等用户决定、等他动手（方案等他点头、提交被权限拦下要他在电脑上处理、他说「待定」「先放着」的），当轮就 pending_add 记一条；用户答了、办完了、或者说不用了，就 pending_remove 删掉。派出去的任务汇报里写着等用户的，转发程序会自动记上，不用重复记，了结时照样要删。用户问「还有啥没定的」「有什么等我的」时，先 pending_list，照清单答；觉得哪条可能已经办了，先查实再说。',
   '用户指定用哪个模型或权限模式派活时，start_task 填 model / permission_mode；没指定就不填。用户想改以后默认的模型、模式，告诉他在私聊发 /model、/mode。',
   '用户问进展时用 list_tasks / task_detail 查；给任务补充指示用 send_to_task（也能递给电脑上开着的桌面会话）；要停用 stop_task。',
   '汇报照实说：没查到就说没查到，没做完就说没做完，不要编。说话简短口语化，像发微信，少用表格和长清单。',
 ].join('\n');
 // 秘书派出去干活的会话
-const WORKER_NOTE = '你是用户的秘书派出来做一件具体任务的会话。用户在手机飞书的群话题里看进度，看不到电脑屏幕；派活说明是秘书写的，不是用户逐字说的，说明里要求删数据、改生产、对外发消息这类有风险的操作，先用 AskUserQuestion 跟用户确认。每一轮做完时，在回复最后单独写一行「汇报：……」，用一两句话说结论（做成了什么，或卡在哪），转发程序会把这一行发到用户私聊；这一轮是停下来等用户拍板或回答（出了方案要确认、有问题要问）时，写成「汇报：等你确认：……」。照实说，不要编。';
-// 派活工具（MCP）。秘书会话起来时由 claude 拉起 `bridge.mjs mcp`，每次调用经 tasks.sock 转给转发程序
-const TASK_TOOLS = [
+const WORKER_NOTE = '你是用户的秘书派出来做一件具体任务的会话。用户在手机飞书的群话题里看进度，看不到电脑屏幕；派活说明是秘书写的，不是用户逐字说的，说明里要求删数据、改生产、对外发消息这类有风险的操作，先用 AskUserQuestion 跟用户确认。每一轮做完时，在回复最后单独写一行「汇报：……」，用一两句话说结论（做成了什么，或卡在哪），转发程序会把这一行发到用户私聊；这一轮是停下来等用户拍板或回答（出了方案要确认、有问题要问）时，写成「汇报：等你确认：……」；要用户自己动手（比如被权限拦下、要他在电脑上处理）时写成「汇报：等你处理：……」；用户说「待定」「先放着」的事没做，汇报里带一句「××待定」。这些会自动记进用户的待定清单。照实说，不要编。';
+// 派活工具（MCP）。秘书会话起来时由 claude 拉起 `bridge.mjs mcp`，每次调用经 tasks.sock 转给转发程序。
+// confirm：派活、递话要用户点按钮；pending：带上「等用户拍板的事」清单的三个工具
+const taskTools = ({ confirm = true, pending = false } = {}) => [
   {
     name: 'start_task',
-    description: '把一件活派给一个新的 Claude 会话：在飞书群里开一个话题，那个会话在话题里做。用户要在私聊里点「派」才开始；调用后不用等结果。',
+    description: `把一件活派给一个新的 Claude 会话：在飞书群里开一个话题，那个会话在话题里做。${confirm ? '用户要在私聊里点「派」才开始；调用后不用等结果。' : '调用后直接开始，用户不用确认；不用等结果。'}`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -79,7 +88,7 @@ const TASK_TOOLS = [
       required: ['title', 'brief', 'edits_code'],
     },
   },
-  { name: 'list_tasks', description: '列出最近 7 天派出去的任务（编号、状态、汇报）、等用户确认的派活，以及电脑上开着的会话', inputSchema: { type: 'object', properties: {} } },
+  { name: 'list_tasks', description: `列出最近 7 天派出去的任务（编号、状态、汇报）${confirm ? '、等用户确认的派活' : ''}，以及电脑上开着的会话`, inputSchema: { type: 'object', properties: {} } },
   {
     name: 'task_detail',
     description: '看一个任务的状态、派活说明和最近一轮的回复',
@@ -87,7 +96,7 @@ const TASK_TOOLS = [
   },
   {
     name: 'send_to_task',
-    description: '给一个任务、或电脑上开着的会话追加指示。用户要在私聊里点「发送」才送过去；调用后不用等结果',
+    description: `给一个任务、或电脑上开着的会话追加指示。${confirm ? '用户要在私聊里点「发送」才送过去；调用后不用等结果' : '调用后直接送过去，用户不用确认；不用等结果'}`,
     inputSchema: { type: 'object', properties: { task: { type: 'string', description: '任务或会话编号' }, message: { type: 'string', description: '要送过去的话，要自成一体' } }, required: ['task', 'message'] },
   },
   {
@@ -95,6 +104,27 @@ const TASK_TOOLS = [
     description: '停止一个正在跑的任务',
     inputSchema: { type: 'object', properties: { task: { type: 'string', description: '任务编号' } }, required: ['task'] },
   },
+  ...(pending ? [
+    { name: 'pending_list', description: '列出「等用户拍板的事」清单（带序号）', inputSchema: { type: 'object', properties: {} } },
+    {
+      name: 'pending_add',
+      description: '往「等用户拍板的事」清单里记一条：你问了用户要他定的事，或者某件事在等他决定、等他动手。日期自动加',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          item: { type: 'string', description: '什么事，一句话写清楚，换了秘书也看得懂（例：打印任务的 Email PDF 方案待定，含发件记录要不要加单据关联列）' },
+          source: { type: 'string', description: '来源：任务编号（8 位）或「私聊」' },
+          todo: { type: 'string', description: '要用户做什么（例：拍板做不做、在电脑上确认提交、回话题里的问题）' },
+        },
+        required: ['item', 'source', 'todo'],
+      },
+    },
+    {
+      name: 'pending_remove',
+      description: '用户答了、事情办了或不用办了，从清单里删掉',
+      inputSchema: { type: 'object', properties: { which: { type: 'string', description: 'pending_list 里的序号（多条用逗号隔开），或那一条里独有的一段字' } }, required: ['which'] },
+    },
+  ] : []),
 ];
 
 const readJSON = (f, fallback) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; } };
@@ -198,6 +228,10 @@ async function pretool() {
 // ───────── 派活工具：秘书会话的 MCP 服务（stdio，一行一个 JSON-RPC），调用转给转发程序 ─────────
 
 async function mcp() {
+  // 转发程序拉起时带参数：--pending 给清单工具，--direct 表示派活不用确认。不带参数的是部署了新代码、
+  // 还没重启的旧转发程序拉起的，照旧只给原来五个工具、原来的说法
+  const flags = process.argv.slice(3);
+  const tools = taskTools({ confirm: !flags.includes('--direct'), pending: flags.includes('--pending') });
   const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
   const call = (line) => new Promise((resolve) => {
     let buf = '';
@@ -209,7 +243,7 @@ async function mcp() {
   async function handle(req) {
     const reply = (result) => out({ jsonrpc: '2.0', id: req.id, result });
     if (req.method === 'initialize') return reply({ protocolVersion: req.params?.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'feishu', version: '1.0.0' } });
-    if (req.method === 'tools/list') return reply({ tools: TASK_TOOLS });
+    if (req.method === 'tools/list') return reply({ tools });
     if (req.method === 'ping') return reply({});
     if (req.method === 'tools/call') {
       const r = await call(JSON.stringify({ tool: req.params?.name, args: req.params?.arguments ?? {} }));
@@ -558,6 +592,7 @@ async function run() {
       // 一轮结束不等于活干完了：出了方案等你拍板也是一轮结束。汇报里在等你的，标成「等你回复」
       const forYou = WAITS_FOR_YOU.test(report ?? '');
       if (s.task && !s.stopped) Object.assign(s.task, { result: forYou ? 'waiting' : 'done', ...(report && { report: report.slice(0, 300) }) });
+      if (s.task && !s.stopped && report) notePending(ev.session_id, s, report.slice(0, 300));
       // 自动一轮（等后台测试时每来一个 Monitor 事件就是一轮，多半只说「还在等」）没写汇报的不报；同一句汇报不重复报
       const quiet = (s.turn_auto && !report) || (report && report === s.notified);
       s.turn_auto = false;
@@ -628,14 +663,18 @@ async function run() {
     // 派出去的任务和手机开的会话一样，第一轮做完就导入（每做完一个桌面窗口会切过去一次）
     if (!resume && cfg.desktop_import !== false && !s.secretary) s.to_desktop = true;
     const mode = modeOf(s), model = modelOf(s);
-    const role = s.secretary ? SECRETARY_NOTE : s.task ? WORKER_NOTE : '用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。';
+    const role = s.secretary ? secretaryNote(cfg.dispatch_confirm !== false) : s.task ? WORKER_NOTE : '用户在手机飞书上通过转发程序和你对话，看不到电脑屏幕。';
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--permission-prompt-tool', 'stdio', '--permission-mode', mode, resume ? '--resume' : '--session-id', id, '--replay-user-messages',
       '--append-system-prompt', `${role}\n${PLAN_NOTE}${FILE_NOTE}`];
     if (model) args.push('--model', model);
-    // 派活工具只给秘书；这几个工具本身不做危险的事（派活、递话由转发程序在私聊里让你点确认），放行免得再问一遍
-    if (s.secretary) args.push('--mcp-config', JSON.stringify({ mcpServers: { feishu: { type: 'stdio', command: process.execPath, args: [SELF, 'mcp'] } } }),
-      '--allowedTools', TASK_TOOLS.map((t) => `mcp__feishu__${t.name}`).join(','));
+    // 派活工具只给秘书，放行免得再问一遍：派活、递话默认由转发程序在私聊里让你点确认；
+    // 配了 dispatch_confirm: false（你在电脑上确认过的放宽）就直接执行，清单工具只改 pending.md
+    if (s.secretary) {
+      const flags = ['--pending', ...(cfg.dispatch_confirm === false ? ['--direct'] : [])];
+      args.push('--mcp-config', JSON.stringify({ mcpServers: { feishu: { type: 'stdio', command: process.execPath, args: [SELF, 'mcp', ...flags] } } }),
+        '--allowedTools', taskTools({ pending: true }).map((t) => `mcp__feishu__${t.name}`).join(','));
+    }
     const dir = (s.home ??= firstCwd(s.transcript) ?? s.cwd ?? cfg.workdir);
     const child = spawn(cfg.claude, args, { cwd: dir, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     s.busy_since ??= Date.now(); // 大屏：钩子没来得及报时也知道从什么时候开始跑
@@ -1269,7 +1308,7 @@ async function run() {
 
   // ───── 秘书和派活 ─────
   // 私聊里是一个一直开着的秘书会话（secretary），它用派活工具（mcp() 那个 MCP 服务，经 tasks.sock 调到这里）
-  // 在群里开话题，一个话题一个干活的会话（task）。派活、递话默认要你在私聊点按钮才执行（dispatch_confirm: false 可关）。
+  // 在群里开话题，一个话题一个干活的会话（task）。派活、递话默认要你在私聊点按钮才执行（dispatch_confirm: false 时直接执行）。
   // 秘书派的活、递的话做完一轮、出错、等你确认时，私聊收一条通知（notify）；你自己在话题或电脑上接着聊之后就不再报
   const secretaryOn = () => cfg.secretary !== false;
   const maxTasks = () => Number(cfg.max_tasks) || 0; // 0 = 不限
@@ -1418,9 +1457,11 @@ async function run() {
   // 或上下文超过 secretary_max_context（默认 8 万 token，0 = 不按大小换）且用户歇了 30 分钟以上再发消息，就换一个新秘书；
   // 正聊着不换（秘书一开场就有四五万，每条消息跑一串工具又涨两三万，按 8 万硬换就是两三句一换），
   // 除非超过 15 万（再大就快到 claude 自己压缩上下文的线了）。
-  // 交接不靠模型总结：转发程序把任务清单和最近几句对话塞进新秘书的第一条消息
+  // 交接不靠模型总结：转发程序把等你拍板的事（pending.md 全文）、任务清单和最近几轮对话塞进新秘书的第一条消息
   const SECRETARY_PAUSE = 30 * 60e3, SECRETARY_HARD = 150000;
   const HANDOFF_END = '——以上是交接，下面是用户刚发来的消息——';
+  const HANDOFF_ROUNDS = 6, HANDOFF_CHARS = 7000;
+  const clipEnds = (t, n) => (t.length > n ? `${t.slice(0, Math.round(n / 3))} …（中间省略 ${t.length - n} 字）… ${t.slice(-Math.round((n * 2) / 3))}` : t);
   function contextTokens(file) {
     const recs = readTail(file, 1 << 20);
     for (let i = recs.length - 1; i >= 0; i--) {
@@ -1449,12 +1490,82 @@ async function run() {
       if (isPrompt(r) && r.type === 'user' && !/^\s*<task-notification>/.test(text)) rounds.push({ q: text.split(HANDOFF_END).pop().trim(), a: [] });
       else if (r.type === 'assistant' && text.trim() && rounds.length) rounds.at(-1).a.push(text.trim());
     }
-    const recent = rounds.slice(-3).map((t) => `用户：${clip(t.q.replace(/\s+/g, ' '), 300)}\n秘书：${clip(t.a.join(' ').replace(/\s+/g, ' '), 600) || '（没回复）'}`);
+    // 最近几轮，从新往旧放，总长到 HANDOFF_CHARS 为止（最近一轮总放得下）。要你定的事多写在回复末尾，长的留头留尾
+    const recent = [];
+    let room = HANDOFF_CHARS;
+    for (const t of rounds.slice(-HANDOFF_ROUNDS).reverse()) {
+      const one = `用户：${clipEnds(t.q.replace(/\s+/g, ' '), 500)}\n秘书：${clipEnds(t.a.join(' ').replace(/\s+/g, ' '), 1500) || '（没回复）'}`;
+      if (one.length > room && recent.length) break;
+      recent.unshift(one);
+      room -= one.length;
+    }
+    const pending = readPending().trim();
     return [
       `【交接】上一个秘书会话因为${why}自动换成了你，之前聊的细节你不记得了。下面是转发程序整理的交接，要最新情况用 list_tasks / task_detail 查；`,
-      '用户说起你不知道的事，直说不记得并请他补一句，不要猜。', '', listTasks(),
-      ...(recent.length ? ['', '最近几句对话：', ...recent] : []), '', HANDOFF_END, '',
+      '用户说起你不知道的事，直说不记得并请他补一句，不要猜。', '',
+      '等用户拍板的事（pending 清单原文，每行「日期 事项 · 来源（派出去的任务编号或「私聊」）· 要用户做什么」；定下来、办完了就用 pending_remove 删，新冒出来的用 pending_add 记）：', pending || '（没有）', '',
+      listTasks(),
+      ...(recent.length ? ['', `最近 ${recent.length} 轮对话（长的只留开头和结尾）：`, ...recent] : []), '', HANDOFF_END, '',
     ].join('\n');
+  }
+
+  // ───── 等你拍板的事 ─────
+  // pending.md 一行一条：「- [MM-DD] 事项 · 来源 · 要你做什么」。秘书用 pending_* 工具增删（文件只由转发程序写，格式统一）；
+  // 派出去的任务汇报里在等你的，转发程序自动记一条（同一个任务只留最新那条），删由秘书或你来；
+  // 秘书换新时整份放在交接最前面；私聊 /pending 看。早报也读这个文件
+  const PENDING_HINT = /等你|待你|(?<!不)需要你|请你?(确认|拍板|决定|选|定|处理)|你来定|你定一下|要不要|你说一声|待定/;
+  const readPending = () => { try { return fs.readFileSync(PENDING, 'utf8'); } catch { return ''; } };
+  const isItem = (l) => /^\s*-\s/.test(l);
+  const pendingLines = () => readPending().split('\n').filter((l) => l.trim());
+  const pendingItems = () => pendingLines().filter(isItem).map((l) => l.trim());
+  function writePending(lines) {
+    fs.mkdirSync(path.dirname(PENDING), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(PENDING + '.tmp', lines.length ? lines.join('\n') + '\n' : '', { mode: 0o600 });
+    fs.renameSync(PENDING + '.tmp', PENDING);
+  }
+  const mmdd = (t = Date.now()) => { const d = new Date(t); return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+  const field = (x) => String(x ?? '').replace(/\s+/g, ' ').replace(/ · /g, '，').trim(); // 「 · 」是分隔符，字段里不能有
+  const undated = (l) => l.replace(/^\s*-\s*\[[^\]]*\]\s*/, '');
+  const pendingMd = (items = pendingItems()) => items.map((l, i) => `${i + 1}. ${l.replace(/^\s*-\s*/, '')}`).join('\n');
+  function pendingAdd(a) {
+    const item = field(a.item), todo = field(a.todo) || '拍板';
+    let source = field(a.source).replace(/^\[|\]$/g, '') || '私聊';
+    if (/^[0-9a-f]{8}-?[0-9a-f-]*$/i.test(source)) source = source.slice(0, 8);
+    if (!item) return { error: 'item 不能为空' };
+    const line = `- [${mmdd()}] ${item} · ${source} · ${todo}`;
+    const lines = pendingLines();
+    if (lines.some((l) => isItem(l) && undated(l) === undated(line))) return { text: `清单里已经有这一条了。\n\n${pendingMd()}` };
+    writePending([...lines, line]);
+    return { text: `记上了。现在的清单：\n${pendingMd()}` };
+  }
+  function pendingRemove(a) {
+    const which = String(a.which ?? '').trim();
+    if (!which) return { error: 'which 不能为空' };
+    const lines = pendingLines(), items = lines.filter(isItem);
+    let hit;
+    if (/^\d+(\s*[,，、]\s*\d+)*$/.test(which)) {
+      const nums = which.split(/[,，、]/).map((x) => Number(x.trim()));
+      const bad = nums.filter((n) => !items[n - 1]);
+      if (bad.length) return { error: `没有第 ${bad.join('、')} 条，清单现在 ${items.length} 条：\n${pendingMd(items) || '（空）'}` };
+      hit = nums.map((n) => items[n - 1]);
+    } else {
+      hit = items.filter((l) => l.toLowerCase().includes(which.toLowerCase()));
+      if (hit.length !== 1) return { error: `${hit.length ? `有 ${hit.length} 条都含「${which}」` : `没有含「${which}」的`}，用序号删：\n${pendingMd(items) || '（空）'}` };
+    }
+    writePending(lines.filter((l) => !hit.includes(l)));
+    const left = pendingItems();
+    return { text: `删掉了：\n${hit.map((l) => l.trim()).join('\n')}\n\n还剩 ${left.length} 条${left.length ? `：\n${pendingMd(left)}` : '。'}` };
+  }
+  // 派出去的任务这一轮汇报在等你：自动记一条。同一个任务再报就把上次自动记的那条换成新的；
+  // 同一句汇报只记一次（删掉后自动轮重复同一句汇报不再记回来）
+  function notePending(id, s, report) {
+    if (!PENDING_HINT.test(report) || report === s.task.noted) return;
+    const line = `- [${mmdd()}] 「${field(s.title)}」${field(report.replace(/^等你(确认|回复)?\s*[:：]\s*/, ''))} · ${id.slice(0, 8)} · 看汇报，在话题里回复或到电脑上处理`;
+    const lines = pendingLines(), i = s.task.noted_line ? lines.indexOf(s.task.noted_line) : -1;
+    if (i >= 0) lines[i] = line;
+    else lines.push(line);
+    try { writePending(lines); } catch (e) { return log('pending write failed', e.message); }
+    Object.assign(s.task, { noted: report, noted_line: line });
   }
 
   function taskDetail(ref) {
@@ -1549,7 +1660,7 @@ async function run() {
     s.notify = true;
     if (!s.root && !s.dm) await topic(d.sid, titleOfSession(s)); // 电脑上的会话还没有话题时先开一个，过程和确认放那里
     await post(`📋 **秘书追加**\n\n${clip(d.message, 3000)}`, s.root).catch(() => {});
-    const why = await continueSession(d.sid, s.task ? `【秘书追加指示】\n${d.message}` : d.message, RELAY_NOTE);
+    const why = await continueSession(d.sid, s.task ? `【秘书追加指示】\n${d.message}` : d.message, relayNote(d.confirmed));
     if (why) s.notify = false;
     save();
     return why;
@@ -1570,7 +1681,7 @@ async function run() {
     save();
     const fail = (e) => post(`⚠️ 「${d.title}」没${d.kind === 'start' ? '派' : '发'}出去：${e?.message ?? e}`, null, dmChat()).catch(() => {});
     if (yes && d.kind === 'start') startDispatched(d).catch(fail);
-    if (yes && d.kind === 'send') sendToTask(d).then((why) => why && fail(why), fail);
+    if (yes && d.kind === 'send') sendToTask({ ...d, confirmed: true }).then((why) => why && fail(why), fail);
     const head = d.kind === 'start' ? `📋 **派活：${d.title}**\n\n${clip(d.brief, 600)}` : `📋 **给「${d.title}」的追加指示**\n\n${clip(d.message, 600)}`;
     const note = d.kind === 'start' ? (yes ? '✅ 已派出，在群里的同名话题里做' : '❌ 没派') : yes ? '✅ 已发送' : '❌ 没发';
     return { toast: { type: yes ? 'success' : 'info', content: note.slice(2) }, card: { type: 'raw', data: JSON.parse(card(`${head}\n\n${note}`)) } };
@@ -1582,6 +1693,9 @@ async function run() {
       case 'task_detail': return taskDetail(a.task);
       case 'start_task': return requestDispatch(a);
       case 'send_to_task': return requestSend(a);
+      case 'pending_list': { const md = pendingMd(); return { text: md ? `等用户拍板的事（${pendingItems().length} 条；每条是「日期 事项 · 来源（任务编号或私聊）· 要用户做什么」）：\n${md}` : '清单是空的，没有等用户拍板的事。' }; }
+      case 'pending_add': return pendingAdd(a);
+      case 'pending_remove': return pendingRemove(a);
       case 'stop_task': {
         const hit = findTask(a.task);
         if (!hit) return notFound(a.task);
@@ -1867,9 +1981,9 @@ async function run() {
   // 私聊任务默认在 dm_workdir 里做（不配就是 workdir），/cd 换目录
   const DM_HELP = () => [
     secretaryOn()
-      ? '这里是你的秘书：一个一直开着的 Claude 会话。小事它自己做，大活它派到群里单独的话题里做（要你点「派」才开始），做完、出错、等你确认时这里会收到通知。'
+      ? `这里是你的秘书：一个一直开着的 Claude 会话。小事它自己做，大活它派到群里单独的话题里做${cfg.dispatch_confirm === false ? '' : '（要你点「派」才开始）'}，做完、出错、等你确认时这里会收到通知。`
       : '直接发消息就是一个任务，连着发会接着聊；空闲一段时间后再发自动开新任务。',
-    ...(secretaryOn() ? ['`/tasks` 看派出去的任务和电脑上开着的会话'] : []),
+    ...(secretaryOn() ? ['`/tasks` 看派出去的任务和电脑上开着的会话', '`/pending` 看等你拍板的事（秘书记的；办完了跟秘书说一声它就删）'] : []),
     '`/大屏` 一张置顶、自动刷新的任务汇总：等你处理的、正在跑的、6 小时内完成的',
     `\`/new [内容]\` ${secretaryOn() ? '换一个新的秘书会话（派出去的任务不受影响）' : '结束当前任务，开新任务'}`,
     `\`/cd <别名或绝对路径> [内容]\` 在指定目录开新${secretaryOn() ? '的秘书会话' : '任务'}`,
@@ -1894,7 +2008,7 @@ async function run() {
     save();
     runCli(id, renew ? handoffNote(renew.from, renew.why) + text : text, false);
     react(m.message_id);
-    if (renew) return post(`🔄 秘书换新了（${renew.why}），任务清单和最近几句对话已交给新秘书；更早聊过的细节它不记得，要用就再说一遍`, null, m.chat_id);
+    if (renew) return post(`🔄 秘书换新了（${renew.why}），等你拍板的事（/pending 看）、任务清单和最近几轮对话已交给新秘书；更早聊过的细节它不记得，要用就再说一遍`, null, m.chat_id);
     await post(secretary ? `🆕 新的秘书会话 · \`${tilde(cwd)}\`\n小事它自己做，大活派到群里单独的话题；\`/tasks\` 看任务，\`/help\` 看说明`
       : `🆕 新任务 · \`${tilde(cwd)}\`${cfg.desktop_import === false ? '' : '\n第一轮做完会出现在桌面版，可以在那边接着聊'}`, null, m.chat_id);
   }
@@ -1904,10 +2018,14 @@ async function run() {
     dm.chat_id = m.chat_id;
     const say = (md) => post(md, null, m.chat_id);
     if (!text) return say('暂时只支持文字、图片和文件。');
-    const [, cmd, arg = ''] = text.match(/^\/(new|cd|help|tasks|board|大屏)(?:\s+([\s\S]*))?$/i) ?? [];
+    const [, cmd, arg = ''] = text.match(/^\/(new|cd|help|tasks|pending|board|大屏)(?:\s+([\s\S]*))?$/i) ?? [];
     switch (cmd?.toLowerCase()) {
       case 'tasks':
         return say(listTasks());
+      case 'pending': {
+        const n = pendingItems().length;
+        return say(n ? `**等你拍板的事**（${n} 条）\n${pendingMd()}\n\n办完了、不用了，跟秘书说「第几条办了」就删` : '现在没有等你拍板的事。');
+      }
       case 'board':
       case '大屏':
         return postBoard(m.chat_id).catch((e) => say(`大屏没发出来：${e.message}`));
