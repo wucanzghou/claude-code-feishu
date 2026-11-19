@@ -29,10 +29,14 @@ const SETTINGS = path.join(os.homedir(), '.claude/settings.json');
 const LABEL = 'com.github.claude-code-feishu';
 const PLIST = path.join(os.homedir(), 'Library/LaunchAgents', LABEL + '.plist');
 const APPROVE_SOCK = path.join(HOME, 'approve.sock');
+const GRANTS = path.join(HOME, 'grants.json'); // 有手机上点过「允许这一次」、还没用掉的放行时才有这个文件
 const IMAGES = path.join(HOME, 'images');
 const FILES = path.join(HOME, 'files');
 // 钩子事件 → [子命令, 超时秒]。PermissionRequest 要等手机回复，放到一天；电脑上先答了的话转发程序会提前放掉它
-const HOOKS = { SessionStart: ['hook', 5], UserPromptSubmit: ['hook', 5], Stop: ['hook', 5], SessionEnd: ['hook', 5], PermissionRequest: ['approve', 86400] };
+// PermissionDenied：自动模式拦下操作时问手机要不要放行这一次，最多等半小时；
+// PreToolUse：每次调用工具都跑，第三项 guard 表示先看 grants.json 在不在，不在就不起 node（不拖慢平常的调用）
+const HOOKS = { SessionStart: ['hook', 5], UserPromptSubmit: ['hook', 5], Stop: ['hook', 5], SessionEnd: ['hook', 5], PermissionRequest: ['approve', 86400],
+  PermissionDenied: ['denied', 1800], PreToolUse: ['pretool', 10, 'guard'] };
 // 只镜像桌面版和终端交互会话，外加本程序拉起的会话；脚本里的 claude -p、SDK 调用不进群
 const MIRRORED = ['claude-desktop', 'claude-desktop-3p', 'cli'];
 // 回复里单独一行「[发送文件] /绝对路径」，转发程序就把那个文件发到手机上
@@ -103,7 +107,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const stdin = async () => { let s = ''; for await (const c of process.stdin) s += c; return s; };
 
-const commands = { setup, install, uninstall, run, hook, inject, approve, mcp };
+const commands = { setup, install, uninstall, run, hook, inject, approve, denied, pretool, mcp };
 const cmd = process.argv[2] ?? 'run';
 if (!commands[cmd]) throw new Error(`未知命令 ${cmd}，可用：${Object.keys(commands).join(' / ')}`);
 await commands[cmd]();
@@ -159,6 +163,36 @@ async function approve() {
     const decision = JSON.parse(answer);
     if (decision?.behavior) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }));
   } catch {}
+}
+
+// 钩子问转发程序一句、等它回（经 approve.sock）。kind 区分是哪种钩子；连不上或超时当没回
+function askBridge(raw, kind, ms) {
+  let req;
+  try { req = { ...JSON.parse(raw), kind }; } catch { return Promise.resolve(null); }
+  return new Promise((resolve) => {
+    let buf = '';
+    const c = net.connect(APPROVE_SOCK, () => c.write(JSON.stringify(req) + '\n'));
+    const timer = ms && setTimeout(() => (c.destroy(), resolve(null)), ms);
+    c.on('data', (d) => (buf += d));
+    c.on('close', () => { clearTimeout(timer); try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
+    c.on('error', () => resolve(null));
+  });
+}
+
+// 自动模式拦下一个操作（PermissionDenied 钩子）：手机发起的那一轮，转发程序发卡片问你要不要放行这一次；
+// 点了「允许这一次」就告诉 Claude 可以重试（拒绝本身不撤销，重试那一下由 pretool 改成要确认，再由转发程序按你点的允许）
+async function denied() {
+  const entry = process.env.CLAUDE_CODE_ENTRYPOINT ?? '';
+  if (!MIRRORED.includes(entry) && !process.env.FEISHU_BRIDGE_CHILD) return;
+  const r = await askBridge(await stdin(), 'denied');
+  if (r?.retry) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionDenied', retry: true } }));
+}
+
+// 每次调用工具前（PreToolUse 钩子，只在有待用的放行时才会跑到这里）：是你在手机上点过「允许这一次」的那一条，
+// 就改成「要确认」，让它不再经自动模式判断，确认请求由转发程序按你点的允许回答
+async function pretool() {
+  const r = await askBridge(await stdin(), 'pretool', 3000);
+  if (r?.ask) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: '你在飞书上点了「允许这一次」' } }));
 }
 
 // ───────── 派活工具：秘书会话的 MCP 服务（stdio，一行一个 JSON-RPC），调用转给转发程序 ─────────
@@ -246,8 +280,11 @@ async function registerApp() {
 async function install() {
   if (!fs.existsSync(CONFIG)) throw new Error('先运行 setup');
   const settings = stripHooks(readJSON(SETTINGS, {}));
-  for (const [e, [sub, timeout]] of Object.entries(HOOKS))
-    ((settings.hooks ??= {})[e] ??= []).push({ hooks: [{ type: 'command', command: `"${process.execPath}" "${SELF}" ${sub}`, timeout }] });
+  for (const [e, [sub, timeout, guard]] of Object.entries(HOOKS)) {
+    const run = `"${process.execPath}" "${SELF}" ${sub}`;
+    const command = guard ? `[ -e "${GRANTS}" ] && exec ${run}; exit 0` : run;
+    ((settings.hooks ??= {})[e] ??= []).push({ hooks: [{ type: 'command', command, timeout }] });
+  }
   writeJSON(SETTINGS, settings);
   console.log(`钩子已写入 ${SETTINGS}`);
   if (process.platform !== 'darwin') return console.log(`请用 systemd、pm2 等常驻运行：node ${SELF}`);
@@ -915,6 +952,7 @@ async function run() {
     const input = req.input ?? {};
     if (!key) return { behavior: 'deny', message: '转发程序找不到这个会话对应的飞书会话，没法确认。' };
     if (s.stopped) return { behavior: 'deny', message: '没有执行：你在手机上点了停止' };
+    if (takeGrant(id, req.tool_name, input, 'asked')) return log('grant used', id.slice(0, 8)), { behavior: 'allow', updatedInput: input };
     const mirror = mirrorOf(s);
     if (req.tool_name === 'AskUserQuestion') return enqueue(key, () => ask(key, root, s.dm, { ...questionSpec(input), sid: id, mirror }));
     if (isImageRead(req.tool_name, input)) return { behavior: 'allow', updatedInput: input };
@@ -965,6 +1003,7 @@ async function run() {
     const s = state.sessions[req.session_id];
     if (!s?.phone) return null;
     if (running.has(req.session_id)) return null; // 转发程序自己起的：不在这里答，CLI 会接着经 stdio 问到 answerTool
+    if (takeGrant(req.session_id, req.tool_name, req.tool_input, 'asked')) return log('grant used', req.session_id.slice(0, 8)), { behavior: 'allow' };
     const key = s.dm ?? s.root;
     if (!key) return null;
     if (req.tool_name === 'AskUserQuestion') { // 钩子答不了选择题，只能在桌面上点
@@ -980,6 +1019,59 @@ async function run() {
     } finally { stop(); }
   }
 
+  // ───── 自动模式拦下的操作：手机上点「允许这一次」 ─────
+  // 手机发起的那一轮里，自动模式（auto）拦下一个操作时，PermissionDenied 钩子问到这里：在话题或私聊发卡片。
+  // 你点「允许这一次」→ 钩子告诉 Claude 可以重试 → 重试那一下 PreToolUse 钩子把它改成「要确认」→
+  // 确认请求（桌面经 PermissionRequest 钩子到 decide，转发程序起的经 stdio 到 answerTool）按你点的允许。
+  // 只放那一条：同一个会话、同一个工具、同样的命令（其他工具比参数，不看 description），用一次，10 分钟内。
+  // 你在电脑上发起的轮次不发卡片，电脑上本来就有提示
+  const grants = []; // { sid, tool, key, until, stage: 'granted'（等重试）| 'asked'（等确认） }
+  const grantKey = (tool, input = {}) => (tool === 'Bash' ? String(input.command ?? '').trim()
+    : canon(Object.fromEntries(Object.entries(input).filter(([k]) => k !== 'description'))));
+  function syncGrants() { // grants.json 在不在决定 PreToolUse 钩子要不要起 node
+    for (let i = grants.length - 1; i >= 0; i--) if (grants[i].until < Date.now()) grants.splice(i, 1);
+    if (grants.length) fs.writeFileSync(GRANTS, String(grants.length), { mode: 0o600 });
+    else fs.rmSync(GRANTS, { force: true });
+  }
+  syncGrants(); // 上次没用掉的放行不留（只在内存里），文件也清掉
+  function takeGrant(sid, tool, input, stage, next) {
+    syncGrants();
+    const key = grantKey(tool, input);
+    const g = grants.find((x) => x.sid === sid && x.tool === tool && x.key === key && x.stage === stage);
+    if (!g) return false;
+    if (next) Object.assign(g, { stage: next, until: Math.min(g.until, Date.now() + 120e3) });
+    else grants.splice(grants.indexOf(g), 1);
+    syncGrants();
+    return true;
+  }
+  const deniedSpec = (req) => ({
+    body: `🚫 **自动模式拦下了：${req.tool_name}**\n原因：${clip(String(req.reason || '没说'), 300)}\n${describe(req).replace(/^🔐 \*\*需要确认：[^\n]*\n/, '')}`,
+    hint: (mins) => '要执行就点「允许这一次」：Claude 会重试这一条，只放这一条、一次，10 分钟内有效。不点就照样不执行。也可以回复 **y** / **n**。' + (mins ? `${mins} 分钟内不回按不允许。` : ''),
+    controls: (id) => [buttonRow([button('允许这一次', { a: 'allow', id }, 'primary_filled'), button('不允许', { a: 'deny', id })])],
+    fromText: (t) => ({ behavior: /^(y|yes|ok|好|是|允许|可以|同意)$/i.test(t) ? 'allow' : 'deny' }),
+    fromClick: (v) => ({ behavior: v.a === 'allow' ? 'allow' : 'deny' }),
+    summary: (r) => (r?.behavior === 'allow' ? '✅ 已允许这一次，Claude 会重试' : '❌ 没允许，照样不执行'),
+    onTimeout: () => ({ behavior: 'deny' }),
+    onAbort: () => null,
+  });
+  async function onDenied(req, gone) {
+    await drain(); // 先把钩子事件读完，才知道这一轮是不是手机发起的
+    const s = state.sessions[req.session_id];
+    if (!s?.phone || s.stopped) return null;
+    const key = s.dm ?? s.root;
+    if (!key) return null;
+    log('denied', req.session_id.slice(0, 8), req.tool_name, String(req.reason ?? '').slice(0, 60));
+    const ctl = new AbortController();
+    gone.addEventListener('abort', () => ctl.abort('会话那边已经不等了'));
+    const r = await enqueue(key, () => ask(key, s.dm ? null : s.root, s.dm, { ...deniedSpec(req), signal: ctl.signal, mirror: mirrorOf(s), sid: req.session_id }));
+    if (r?.behavior !== 'allow') return null;
+    grants.push({ sid: req.session_id, tool: req.tool_name, key: grantKey(req.tool_name, req.tool_input), until: Date.now() + 10 * 60e3, stage: 'granted' });
+    syncGrants();
+    log('grant', req.session_id.slice(0, 8), req.tool_name);
+    return { retry: true };
+  }
+  const onPreTool = (req) => (takeGrant(req.session_id, req.tool_name, req.tool_input, 'granted', 'asked') ? (log('grant ask', req.session_id.slice(0, 8), req.tool_name), { ask: true }) : null);
+
   fs.rmSync(APPROVE_SOCK, { force: true });
   net.createServer((c) => {
     let buf = '', done = false;
@@ -988,8 +1080,11 @@ async function run() {
       if (done || !buf.includes('\n')) return;
       done = true;
       let decision = null;
-      try { decision = await decide(JSON.parse(buf), gone.signal); } catch (e) { log('approve failed', e.message); }
-      if (decision) log('approve', decision.behavior);
+      try {
+        const req = JSON.parse(buf);
+        decision = req.kind === 'denied' ? await onDenied(req, gone.signal) : req.kind === 'pretool' ? onPreTool(req) : await decide(req, gone.signal);
+        if (decision?.behavior) log('approve', decision.behavior);
+      } catch (e) { log('approve failed', e.message); }
       c.end(JSON.stringify(decision));
     });
     const gone = new AbortController(); // 钩子进程没了（会话退出、钩子到时被杀），连接会断
